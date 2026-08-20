@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Preview</title>
+    <style type="text/css">
+      .left {
+        float: left;
+        width: 50%;
+      }
+      .right {
+        margin-left: 50%;
+      }
+    </style>
+  </head>
+
+  <body>
+    <center>
+      <h1>Preview</h1>
+    </center>
+    <div class="left">
+      <form action="/preview.gxn" method="post" target="preview">
+        <input type="radio" name="gx" value="metapost" checked="checked" /> metapost
+        &nbsp;&nbsp;<input type="radio" name="gx" value="tikz"/> tikz
+        &nbsp;&nbsp;<input type="radio" name="gx" value="graphviz"/> graphviz
+        <select name="cmd">
+          <option value="" selected="selected">select</option>
+          <option value="dot">dot</option>
+          <option value="neato">neato</option>
+          <option value="fdp">fdp</option>
+          <option value="sfdp">sfdp</option>
+          <option value="twopi">twopi</option>
+          <option value="circo">circo</option>
+        </select>
+        <br/>
+        <textarea name="code" cols="65" rows="35"></textarea>
+        <br/>
+        <input type="submit" value="Preview"/>
+        <input type="reset" value="Reset">
+      </form>
+    </div>
+    <div class="right">
+      <br/>
+      <iframe name="preview" src="" width="420" height="450" align="center"
+              style="border:none"/>
+    </div>
+  </body>
+</html>
+
