@@ -10,15 +10,15 @@ FROM ubuntu:resolute
 LABEL maintainer="Soojin Nam <jsunam@gmail.com>"
 
 # The graphics engines, from Ubuntu 26.04 LTS: MetaPost from TeX Live 2025 and
-# Graphviz 14. texlive-latex-base is here because a figure whose labels open
-# with `verbatimtex %&latex` has MetaPost typeset them with LaTeX, and
-# riemann.mp and whatever.mp in the samples do exactly that.
+# Graphviz 14. No LaTeX: btex labels are typeset by the plain eTeX that
+# texlive-metapost already carries, so the samples say `%&plain` where they
+# once said `%&latex`.
 #
 # Graphviz 14 ships only dot in the graphviz package; neato, fdp, sfdp, twopi
 # and circo live in the neato-layout plugin, which nothing depends on.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends -y install \
-       texlive-metapost texlive-latex-base \
+       texlive-metapost \
        graphviz libgvplugin-neato-layout8 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,7 +1,5 @@
 verbatimtex
-%&latex                   % necessary for \,
-\documentclass{article}
-\begin{document}
+%&plain
 etex
 
 u:=25;                    % 25 = 25bp = 25 PostScript points = 25/72 in
@@ -62,7 +60,7 @@ beginfig(1)
   label.lrt("z10 = z1 intersectionpoint z1", z1-(.3u, .4u));  
   dotlabel.urt(btex z7=whatever[z1, z4]=whatever[z2, z3] etex, z7);   % `]' gets lost
   draw z5--z8-(.1u, u)--z8-(.1u, .1u)--z8;                            % without btex ... etex
-  label.rt(btex z5=(z1-\,-z3)intersectionpoint(z2-\,-z4) etex, z8);   % \, is a LaTeX command
+  label.rt(btex z5=(z1-\thinspace-z3)intersectionpoint(z2-\thinspace-z4) etex, z8);
   draw z9--z9+(.1u, 0)--z6-(0, u)--z6;
   label.lft(btex z6=f[z1, z2]=g[z3, z4] etex, z9);
 endfig;

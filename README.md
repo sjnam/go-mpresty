@@ -89,15 +89,15 @@ The routes `mpresty.conf` declared, and what replaced each one:
 
 ## Requirements
 
-MetaPost and Graphviz. A figure whose labels open with `verbatimtex %&latex`
-has MetaPost typeset them with LaTeX, so a LaTeX format needs to be installed
-too — `texlive-latex-base` is enough.
+MetaPost and Graphviz, and nothing else. `btex ... etex` labels are typeset by
+the plain eTeX that comes with MetaPost, so no LaTeX installation is needed;
+the sample figures that once opened `verbatimtex %&latex` now say `%&plain`.
 
 Since Graphviz 14 the `graphviz` package carries only `dot`; `neato`, `fdp`,
 `sfdp`, `twopi` and `circo` need the neato-layout plugin
 (`libgvplugin-neato-layout8` on Debian and Ubuntu), which nothing pulls in for
 you. The [Dockerfile](Dockerfile) installs it, on Ubuntu 26.04 LTS, which
-brings TeX Live 2025 and Graphviz 14 for a 374MB image.
+brings TeX Live 2025 and Graphviz 14 for a 334MB image.
 
 mpresty names any engine it cannot find on `PATH` when it starts.
 

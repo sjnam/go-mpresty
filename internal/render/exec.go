@@ -92,8 +92,8 @@ func (p *Processor) build(ctx context.Context, r *Renderer, cmd, fname, content 
 		// images directory; an isolated job needs a search path. The trailing
 		// separator keeps the system defaults.
 		//
-		// TEXINPUTS is here for MetaPost's sake: a figure whose labels open
-		// with `verbatimtex %&latex` has makempx typeset them with LaTeX.
+		// TEXINPUTS is here for MetaPost's sake: btex labels are typeset by
+		// makempx, which shells out to eTeX and searches along it.
 		"MPINPUTS="+p.inputs(dir),
 		"TEXINPUTS="+p.inputs(dir),
 	)
