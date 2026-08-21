@@ -25,18 +25,7 @@ func ExemplesUpdateNode(doc, node *htmldoc.Node, uri, content string) {
 	node.AppendChild(htmldoc.CreateElement("hr"))
 }
 
-// TikzUpdateNode frames the image and keeps the source as alt text, as
-// upnode.lua did for <tikz>.
-func TikzUpdateNode(doc, node *htmldoc.Node, uri, content string) {
-	htmldoc.Rename(node, "img")
-	htmldoc.SetAttr(node, "src", uri)
-	htmldoc.SetAttr(node, "width", "200")
-	htmldoc.SetAttr(node, "style", "border:5px solid black")
-	htmldoc.SetAttr(node, "alt", content)
-}
-
 // UpdateNodeByTag is the per-tag table /updatenode.html uses.
 var UpdateNodeByTag = map[string]render.UpdateNodeFunc{
 	"metapost": ExemplesUpdateNode,
-	"tikz":     TikzUpdateNode,
 }

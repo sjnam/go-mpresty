@@ -98,14 +98,10 @@ func New(opts Options) (*Processor, error) {
 		p.byTag[r.Tag] = r
 		p.byExt[r.Ext] = r
 		// An engine that is not installed still renders — as a red error on
-		// the page. Say so at startup rather than at the first request, and
-		// check every step: TikZ needs its PDF-to-SVG converter as much as it
-		// needs LaTeX.
-		for _, argv := range r.Steps(r.Cmd, "probe") {
-			if _, err := exec.LookPath(argv[0]); err != nil {
-				p.log.Warn("engine not installed; its elements will render as errors",
-					"tag", r.Tag, "cmd", argv[0])
-			}
+		// the page. Say so at startup rather than at the first request.
+		if _, err := exec.LookPath(r.Cmd); err != nil {
+			p.log.Warn("engine not installed; its elements will render as errors",
+				"tag", r.Tag, "cmd", r.Cmd)
 		}
 	}
 	return p, nil

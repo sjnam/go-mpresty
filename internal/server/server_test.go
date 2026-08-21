@@ -22,8 +22,8 @@ func fake() *render.Renderer {
 		Ext:      "txt",
 		Cmd:      "cp",
 		Commands: []string{"cp"},
-		Steps: func(cmd, fname string) [][]string {
-			return [][]string{{"cp", fname + ".txt", fname + ".svg"}}
+		Command: func(cmd, fname string) []string {
+			return []string{"cp", fname + ".txt", fname + ".svg"}
 		},
 	}
 }

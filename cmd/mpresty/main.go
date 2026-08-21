@@ -1,5 +1,5 @@
-// Command mpresty serves a document root, turning MetaPost, TikZ and Graphviz
-// source embedded in its HTML pages into SVG images.
+// Command mpresty serves a document root, turning MetaPost and Graphviz source
+// embedded in its HTML pages into SVG images.
 //
 // It is a Go port of https://github.com/sjnam/mpresty, which did the same with
 // OpenResty and Lua.

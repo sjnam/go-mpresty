@@ -22,8 +22,8 @@ func fake() *Renderer {
 		Commands:  []string{"cp"},
 		Preamble:  "P:",
 		Postamble: ":Q",
-		Steps: func(cmd, fname string) [][]string {
-			return [][]string{{"cp", fname + ".txt", fname + ".svg"}}
+		Command: func(cmd, fname string) []string {
+			return []string{"cp", fname + ".txt", fname + ".svg"}
 		},
 	}
 }

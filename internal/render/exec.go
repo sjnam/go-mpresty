@@ -61,8 +61,8 @@ func (p *Processor) inputs(dir string) string {
 // finished SVG into the work directory.
 //
 // Isolation matters more here than it did in Lua: MetaPost's makempx writes
-// fixed-name temporary files, and TeX writes .aux and .log beside the source,
-// so genuinely parallel runs sharing one directory would collide.
+// fixed-name temporary files, so genuinely parallel runs sharing one directory
+// would collide.
 func (p *Processor) build(ctx context.Context, r *Renderer, cmd, fname, content string) error {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
@@ -78,30 +78,32 @@ func (p *Processor) build(ctx context.Context, r *Renderer, cmd, fname, content 
 		return err
 	}
 
-	for _, argv := range r.Steps(cmd, fname) {
-		c := exec.CommandContext(ctx, argv[0], argv[1:]...)
-		c.Dir = dir
-		// Engines must never wait on a terminal, and TeX in particular starts
-		// looking for input files wherever it pleases unless told otherwise.
-		c.Stdin = nil
-		c.Env = append(os.Environ(),
-			"TEXMFOUTPUT="+dir,
-			"openout_any=p",
-			// A source may `input` a sibling, as benchmark.html's bird.mp
-			// inputs courbes.mp. The Lua version got that for free by running
-			// in the images directory; an isolated job needs a search path.
-			// The trailing separator keeps the system defaults.
-			"MPINPUTS="+p.inputs(dir),
-			"TEXINPUTS="+p.inputs(dir),
-		)
-		var out bytes.Buffer
-		c.Stdout, c.Stderr = &out, &out
-		if err := c.Run(); err != nil {
-			if ctx.Err() != nil {
-				return fmt.Errorf("%s: %w", argv[0], ctx.Err())
-			}
-			return fmt.Errorf("%s: %w\n%s", argv[0], err, diagnostics(dir, fname, out.String()))
+	argv := r.Command(cmd, fname)
+	c := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	c.Dir = dir
+	// Engines must never wait on a terminal, and TeX in particular starts
+	// looking for input files wherever it pleases unless told otherwise.
+	c.Stdin = nil
+	c.Env = append(os.Environ(),
+		"TEXMFOUTPUT="+dir,
+		"openout_any=p",
+		// A source may `input` a sibling, as benchmark.html's bird.mp inputs
+		// courbes.mp. The Lua version got that for free by running in the
+		// images directory; an isolated job needs a search path. The trailing
+		// separator keeps the system defaults.
+		//
+		// TEXINPUTS is here for MetaPost's sake: a figure whose labels open
+		// with `verbatimtex %&latex` has makempx typeset them with LaTeX.
+		"MPINPUTS="+p.inputs(dir),
+		"TEXINPUTS="+p.inputs(dir),
+	)
+	var out bytes.Buffer
+	c.Stdout, c.Stderr = &out, &out
+	if err := c.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s: %w", argv[0], ctx.Err())
 		}
+		return fmt.Errorf("%s: %w\n%s", argv[0], err, diagnostics(dir, fname, out.String()))
 	}
 
 	svg := filepath.Join(dir, fname+".svg")

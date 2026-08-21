@@ -31,7 +31,7 @@ func TestParseShieldsRawBodies(t *testing.T) {
 func TestParseLeavesOrdinaryMarkupAlone(t *testing.T) {
 	const in = `<html><body><h1>t</h1><metapost src="tree.mp" width="200"></metapost>` +
 		`<img src="/source/rgb.mp" width="180"></body></html>`
-	doc, err := Parse(stringReader(in), "metapost", "tikz", "graphviz")
+	doc, err := Parse(stringReader(in), "metapost", "graphviz")
 	if err != nil {
 		t.Fatal(err)
 	}

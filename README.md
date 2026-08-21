@@ -1,7 +1,7 @@
 # go-mpresty
 
-A web application that turns MetaPost, TikZ and Graphviz source written *inside*
-an HTML page into SVG images, on the way out.
+A web application that turns MetaPost and Graphviz source written *inside* an
+HTML page into SVG images, on the way out.
 
 This is a Go port of [mpresty](https://github.com/sjnam/mpresty), which did the
 same thing with OpenResty and Lua. It keeps the page syntax, the routes and the
@@ -51,9 +51,8 @@ endfig;
 ```
 
 | element | file extension | engine | `cmd` may select |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `<metapost>` | `.mp` | `mpost` | `mpost`, `mpost-lua` |
-| `<tikz>` | `.tex` | `pdflatex` + a PDF-to-SVG step | `pdflatex`, `lualatex`, `xelatex` |
 | `<graphviz>` | `.gv` | `dot` | `dot`, `neato`, `fdp`, `sfdp`, `twopi`, `circo`, `osage`, `patchwork` |
 
 Attributes the renderer consumes and strips: `src`, `cmd`, and `cache="no"` to
@@ -68,7 +67,7 @@ log appears in red where the image would have been.
 The routes `mpresty.conf` declared, and what replaced each one:
 
 | route | Lua original | here |
-|---|---|---|
+| --- | --- | --- |
 | `/*.html` | `content_by_lua_block` | default rewrite to `<img>` |
 | `/benchmark.html` | timing wrapper | same, appends elapsed seconds |
 | `/exemples.html` | `lua/exemples.lua` | `server.ExemplesUpdateNode` |
@@ -78,7 +77,7 @@ The routes `mpresty.conf` declared, and what replaced each one:
 
 ## Flags
 
-```
+```text
 -addr string       address to listen on (default ":8080")
 -root string       document root (default "webapp/html")
 -workdir string    directory for rendered SVGs, relative to root (default "images")
@@ -90,28 +89,15 @@ The routes `mpresty.conf` declared, and what replaced each one:
 
 ## Requirements
 
-MetaPost, LaTeX with PGF/TikZ, and Graphviz, as before. The TikZ pipeline needs
-one PDF-to-SVG converter; mpresty uses the first of `pdf2svg`, `pdftocairo`,
-`mutool` or `dvisvgm --pdf` it finds on `PATH`, so a TeX Live installation with
-`pdftocairo` or MuPDF alongside needs nothing extra.
+MetaPost and Graphviz. A figure whose labels open with `verbatimtex %&latex`
+has MetaPost typeset them with LaTeX, so a LaTeX format needs to be installed
+too — `texlive-latex-base` is enough.
 
 Since Graphviz 14 the `graphviz` package carries only `dot`; `neato`, `fdp`,
 `sfdp`, `twopi` and `circo` need the neato-layout plugin
 (`libgvplugin-neato-layout8` on Debian and Ubuntu), which nothing pulls in for
-you. The [Dockerfile](Dockerfile) installs it.
-
-The image is built on Ubuntu 26.04 LTS, which brings TeX Live 2025 and
-Graphviz 14. It carries MetaPost and Graphviz only: LaTeX with PGF/TikZ costs
-some 270MB, most of it emoji and icon fonts nothing here draws with, so `<tikz>`
-elements render as a red error until you add the packages:
-
-```dockerfile
-FROM mpresty:latest
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends -y install \
-       texlive-pictures texlive-latex-extra pdf2svg \
-    && rm -rf /var/lib/apt/lists/*
-```
+you. The [Dockerfile](Dockerfile) installs it, on Ubuntu 26.04 LTS, which
+brings TeX Live 2025 and Graphviz 14 for a 374MB image.
 
 mpresty names any engine it cannot find on `PATH` when it starts.
 
@@ -134,8 +120,7 @@ configuration and everything per-request travels as an argument.
 
 **Each engine run gets its own directory.** The Lua version ran every engine in
 `images/` and cleaned up with `rm F.log F.mp*`. MetaPost's `makempx` writes
-fixed-name temporaries and TeX drops `.aux` and `.log` beside the source, so
-genuinely parallel runs would have collided. Jobs now run in a scratch directory
+fixed-name temporaries, so genuinely parallel runs would have collided. Jobs now run in a scratch directory
 and only the finished SVG is moved into `images/`. Sources that `input` a
 sibling still resolve: the document root is on the kpathsea search path.
 
@@ -154,7 +139,7 @@ VM would restore it if that flexibility is worth the dependency.
 Rendering the 32 images of `benchmark.html` from a cold cache, on a 10-core M-series Mac:
 
 | `-jobs` | time |
-|---|---|
+| --- | --- |
 | 1 | 8.45s |
 | 4 | 2.52s |
 | 0 (GOMAXPROCS) | 1.43s |
@@ -165,7 +150,7 @@ one engine run.
 
 ## Layout
 
-```
+```text
 cmd/mpresty/      flags, wiring, graceful shutdown
 internal/render/  the engines, the job runner, the document walker
 internal/htmldoc/ parsing with shielded raw bodies, DOM helpers, serialization

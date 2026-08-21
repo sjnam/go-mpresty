@@ -105,17 +105,3 @@ func TestEngineFailureBecomesVisibleError(t *testing.T) {
 		t.Errorf("error text does not name the engine: %q", got)
 	}
 }
-
-func TestTikzPicksAnInstalledConverter(t *testing.T) {
-	r := Tikz("")
-	steps := r.Steps("pdflatex", "f")
-	if len(steps) != 2 {
-		t.Fatalf("got %d steps, want 2", len(steps))
-	}
-	if _, err := exec.LookPath(steps[1][0]); err != nil {
-		t.Skipf("no PDF-to-SVG converter installed; tried %v", PDFConverters())
-	}
-	if named := Tikz("pdftocairo"); named.Steps("pdflatex", "f")[1][0] != "pdftocairo" {
-		t.Error("an explicitly named converter was ignored")
-	}
-}
