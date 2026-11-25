@@ -87,6 +87,7 @@ The routes `mpresty.conf` declared, and what replaced each one:
 -timeout duration  wall clock budget for one engine run (default 30s)
 -jobs int          concurrent engine runs (0 = GOMAXPROCS)
 -cache int         cache entries to keep (0 = default)
+-confine           confine engine file reads to the document root (default true)
 -v                 log at debug level
 ```
 
@@ -106,7 +107,7 @@ mpresty names any engine it cannot find on `PATH` when it starts.
 
 ## How it differs from the Lua original
 
-Four of these are fixes, one is a loss.
+Five of these are fixes, one is a loss.
 
 **Graphics source survives the HTML parser.** The HTML5 tokenizer reads `<`
 followed by a letter as a tag open, so a line like `if a<b:` lost everything
@@ -131,6 +132,16 @@ sibling still resolve: the document root is on the kpathsea search path.
 string; commands now run as argv, and each renderer has an allow-list. Local
 `src` paths are confined to the document root, which `ngx.location.capture` used
 to do for free.
+
+**Engines cannot read outside the document root.** MetaPost will `input` or
+`readfrom` any file it is pointed at, and it ignores kpathsea's `openin_any`,
+so code posted to `/preview.gxn` could read `/etc/passwd` and see it in the
+error log. On Linux each engine run is now confined with Landlock to the
+document root and the system and TeX directories. mpresty tries this once at
+startup and, where it cannot work, logs a warning and runs the engines
+unconfined: on macOS, on kernels without Landlock, and on a document root that
+Docker Desktop shares from a Mac host, as `docker-compose.yml` does. Leave the
+pages in the image, or run on a Linux host, to keep the confinement.
 
 **Customisation is compiled, not scripted.** This is what the port gives up.
 Dropping `exemples.lua` next to the config was enough before; now an

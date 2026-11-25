@@ -58,6 +58,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -180,6 +181,7 @@ type Options struct {
 	Cache     *cache.Cache  // caches remote sources
 	Client    *http.Client  // fetches remote sources
 	Renderers []*Renderer   // the engines
+	Confine   bool          // confine the engines' file reads (Linux)
 	Logger    *slog.Logger
 }
 
@@ -202,6 +204,7 @@ type Processor struct {
 	byTag map[string]*Renderer
 	byExt map[string]*Renderer
 	group singleflight.Group
+	self  string // this executable, when the engines run confined
 }
 
 @ The constructor fills in the defaults, builds the processor, and makes sure
@@ -217,6 +220,9 @@ func New(opts Options) (*Processor, error) {
 	@<Create the processor |p|@>
 	if err := os.MkdirAll(p.tmpDir, 0o755); err != nil {
 		return nil, err
+	}
+	if opts.Confine {
+		@<Check that the engines can be confined, and set |p.self|@>
 	}
 	@<Register the renderers of |opts| with |p|@>
 	return p, nil
@@ -588,17 +594,27 @@ running in the directory where the sources were; an isolated job needs a
 search path that includes the document root. \.{TEXINPUTS} is there for
 MetaPost's sake as well, because \.{btex} labels are typeset by \.{makempx},
 which runs plain \TeX\ and searches along it.
+
+When the engines run confined, the command is this very program, given the
+engine's argument vector and one more variable in its environment; the next
+part explains why.
 @<Run the engine in |dir|@>=
 argv := r.Command(cmd, fname)
-c := exec.CommandContext(ctx, argv[0], argv[1:]...)
-c.Dir = dir
-c.Stdin = nil
-c.Env = append(os.Environ(),
+env := append(os.Environ(),
 	"TEXMFOUTPUT="+dir,
 	"openout_any=p",
 	"MPINPUTS="+p.inputs(dir),
 	"TEXINPUTS="+p.inputs(dir),
 )
+name, args := argv[0], argv[1:]
+if p.self != "" {
+	name, args = p.self, argv
+	env = append(env, confineEnv+"="+p.root)
+}
+c := exec.CommandContext(ctx, name, args...)
+c.Env = env
+c.Dir = dir
+c.Stdin = nil
 var out bytes.Buffer
 c.Stdout, c.Stderr = &out, &out
 if err := c.Run(); err != nil {
@@ -646,6 +662,215 @@ if _, err := os.Stat(svg); err != nil {
 	return nil, fmt.Errorf("%s produced no %s.svg", cmd, fname)
 }
 return nil, os.Rename(svg, p.svgPath(fname))
+
+@* Confining the engines.
+\TeX\ and MetaPost read files, and the source they are given decides which.
+That is harmless on a page the site's author wrote, but the preview runs code
+posted by anyone, and on 25 November 2026 I found that it could read any file
+the server can. A posted
+$$\hbox{\.{input /etc/passwd;}}$$
+makes MetaPost read the file as source, choke on it, and report the offending
+line in the log that comes back in red. \.{readfrom} reads a file line by line
+into strings, and \.{errmessage} prints them; and \.{/proc/self/environ}
+holds the engine's environment, which is the server's environment, secrets
+and all.
+
+kpathsea has a knob for this, \.{openin\_any=p}, the reading twin of the
+\.{openout\_any=p} the engines already get. I tried it, and MetaPost ignores
+it: absolute names, \.{..}, \.{readfrom}, everything still read the secret.
+MetaPost does consult \.{openout\_any} before it writes, so writing outside
+the job directory was never open. Reading had to be closed some other way, and
+filtering the source is hopeless in a language with \.{scantokens} and string
+concatenation. The operating system must do it.
+
+On Linux it can, through Landlock: a process may give up rights to the file
+system, irrevocably, for itself and every process it starts. An engine run is
+confined to reading the document root (where its own job directory lies too)
+and the directories that hold the system and \TeX: programs, libraries, fonts,
+the format files. Everything else, \.{/etc/passwd}, \.{/proc}, the mounted
+secrets of a container, is out of reach. Writing is left alone, since
+\.{openout\_any} already does that job.
+
+@ A process confines {\it itself}, so the confining has to happen in the
+process that becomes the engine, after |fork| and before |exec|. \GO/ offers no
+way to run code there, so mpresty runs itself instead. It starts its own
+executable with the engine's argument vector and the variable |confineEnv|
+in the environment, naming what may be read. That copy calls |RunConfined|
+first thing, sees the variable, confines itself, and replaces itself by the
+engine through |execve|, which keeps the process, its confinement and its
+place under the context's deadline.
+@<The processor@>=
+const confineEnv = "MPRESTY_CONFINE"
+
+@ |RunConfined| must therefore be the first thing |main| does, and the first
+thing a test binary does, for a test may start a confined engine too. In any
+process whose environment lacks the variable it returns at once.
+
+Landlock confines a thread, and the confinement is inherited across |execve|
+by the thread that calls it; so the goroutine locks itself to its thread from
+the start. The engine's path is looked up before the gates close.
+
+Called with no engine at all, the copy is a probe, which the processor sends
+out once at startup: it confines itself and then tries to list the directories
+it was promised. If that works, so will the engines.
+@<Functions@>=
+// RunConfined must be the first thing main does. In a process a Processor
+// started to run an engine, it confines file reads and execs the engine;
+// anywhere else it returns at once.
+func RunConfined() {
+	spec, ok := os.LookupEnv(confineEnv)
+	if !ok {
+		return
+	}
+	os.Unsetenv(confineEnv)
+	runtime.LockOSThread()
+	readable, argv := strings.Split(spec, "\n"), os.Args[1:]
+	var path string
+	var err error
+	if len(argv) > 0 {
+		path, err = exec.LookPath(argv[0])
+	}
+	if err == nil {
+		err = confine(readable)
+	}
+	if err == nil && len(argv) == 0 {
+		@<Probe whether the confined process can read |readable|@>
+	}
+	if err == nil {
+		err = syscall.Exec(path, argv, os.Environ())
+	}
+	fmt.Fprintf(os.Stderr, "mpresty: cannot run confined: %v\n", err)
+	os.Exit(126)
+}
+
+@ @<Probe whether the confined process can read |readable|@>=
+for _, dir := range readable {
+	if _, err = os.ReadDir(dir); err != nil {
+		break
+	}
+}
+if err == nil {
+	os.Exit(0)
+}
+
+@ The probe can fail for three reasons: the system is not Linux, the kernel
+lacks Landlock, or the document root lies on a file system Landlock cannot
+follow. The last one is not hypothetical. Docker Desktop for the Mac shares a
+host directory with a container through a file system of its own, and a
+directory shared that way---the \.{docker-compose.yml} of this repository
+shares \.{webapp/html}---cannot be granted to a confined process at all; the
+engines could not even read their own source. Rather than break the server,
+mpresty then runs the engines unconfined and says so at startup. On a Linux
+host, or with the pages copied into the image, the probe succeeds.
+@<Check that the engines can be confined, and set |p.self|@>=
+self, err := os.Executable()
+if err == nil {
+	probe := exec.Command(self)
+	probe.Env = append(os.Environ(), confineEnv+"="+root)
+	var out bytes.Buffer
+	probe.Stdout, probe.Stderr = &out, &out
+	if err = probe.Run(); err != nil {
+		err = fmt.Errorf("%w: %s", err, strings.TrimSpace(out.String()))
+	}
+}
+if err == nil {
+	p.self = self
+} else {
+	p.log.Warn("engines run unconfined and may read any file the server can", "err", err)
+}
+
+@ The confinement itself is Linux code, so \.{GTANGLE} writes it to a file of
+its own, \.{confine\_linux.go}, which the \GO/ tools compile only on Linux. A
+Landlock {\it ruleset\/} names the rights it handles, here reading files and
+listing directories; every right it handles is denied unless a rule grants it
+beneath some directory. The ruleset is filled with rules, the thread promises
+never to gain privileges again (Landlock insists), and then the ruleset is
+applied. The package \.{golang.org/x/sys/unix} has the constants and
+structures, so no library is needed for three system calls.
+@(confine_linux.go@>=
+//go:build linux
+
+package render
+
+import (
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+@<Places every engine may read@>
+
+const confineRights = unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR
+
+func confine(readable []string) error {
+	attr := unix.LandlockRulesetAttr{Access_fs: confineRights}
+	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
+		uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
+	if errno != 0 {
+		return errno
+	}
+	defer unix.Close(int(fd))
+	for _, name := range append(systemReadable, readable...) {
+		@<Let the engine read beneath |name|, if it exists@>
+	}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return err
+	}
+	if _, _, errno := unix.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, fd, 0, 0); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+@ A rule is anchored to an open file descriptor, so a place that does not
+exist on this system is simply skipped. A rule for a single file may grant only
+the rights that make sense for a file; listing it is not one of them.
+@<Let the engine read beneath |name|, if it exists@>=
+f, err := unix.Open(name, unix.O_PATH|unix.O_CLOEXEC, 0)
+if err != nil {
+	continue
+}
+rights := uint64(confineRights)
+var st unix.Stat_t
+if unix.Fstat(f, &st) == nil && st.Mode&unix.S_IFMT != unix.S_IFDIR {
+	rights = unix.LANDLOCK_ACCESS_FS_READ_FILE
+}
+rule := unix.LandlockPathBeneathAttr{Allowed_access: rights, Parent_fd: int32(f)}
+_, _, errno := unix.Syscall6(unix.SYS_LANDLOCK_ADD_RULE, fd,
+	unix.LANDLOCK_RULE_PATH_BENEATH, uintptr(unsafe.Pointer(&rule)), 0, 0, 0)
+unix.Close(f)
+if errno != 0 {
+	return errno
+}
+
+@ The places every engine may read are the system's programs and libraries,
+\TeX's trees, its configuration and generated files, and the fonts with
+Graphviz's configuration. I found the list by running MetaPost, with \.{btex}
+labels and an \.{input} of a sibling, and \.{dot} and \.{neato}, confined in
+the Docker image, and it is generous on purpose: a \TeX\ Live installed by hand
+lives under \.{/usr/local} or \.{/opt}. \.{/etc} as a whole is not on it, nor
+is \.{/proc}.
+@<Places every engine may read@>=
+var systemReadable = []string{
+	"/usr", "/lib", "/lib32", "/lib64", "/bin", "/sbin", "/opt",
+	"/etc/texmf", "/etc/fonts", "/etc/ld.so.cache",
+	"/var/lib/texmf", "/var/cache/fontconfig",
+	"/dev/null", "/dev/urandom",
+}
+
+@ Everywhere else, |confine| fails, the probe fails with it, and the engines
+run unconfined after the warning above. This is the one function that exists
+only to have two bodies, one per operating system.
+@(confine_other.go@>=
+//go:build !linux
+
+package render
+
+import "errors"
+
+func confine(readable []string) error {
+	return errors.New("confining file reads needs Landlock, which only Linux has")
+}
 
 @* Showing the result.
 If |err| is set, the node becomes a red \.{<pre>} with the message in it, so
@@ -700,6 +925,15 @@ import (
 )
 
 @<Test helpers@>
+
+@ A test may start a confined engine, and the confined copy of the test
+binary must become the engine before the testing package gets going; that is
+the business of |RunConfined|, which returns at once in the test itself.
+@(render_test.go@>=
+func TestMain(m *testing.M) {
+	RunConfined()
+	os.Exit(m.Run())
+}
 
 @ Every test makes its processor in a temporary directory of its own, with the
 fake engine as its only renderer and a logger that says nothing.
@@ -1090,6 +1324,58 @@ func TestEngineFailureBecomesVisibleError(t *testing.T) {
 	if got := htmldoc.TextContent(pre[0]); !strings.Contains(got, "mpost") {
 		t.Errorf("error text does not name the engine: %q", got)
 	}
+}
+
+@ Last, the reading that confinement exists to stop. A file outside the root
+holds a secret, and two sources try to read it: one by \.{input}, the other by
+\.{readfrom}, printing what it read with \.{errmessage}. A third \.{input}s a
+sibling inside the root, which must keep working.
+
+The test first runs the attacks with confinement off, as a control: the
+secret must show up then, or the test proves nothing. Then it runs everything
+confined, if this system can confine at all, which on anything but Linux it
+cannot.
+@(render_test.go@>=
+func TestConfinedEngineReadsOnlyUnderRoot(t *testing.T) {
+	requireCommand(t, "mpost")
+	root := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret.mp")
+	writeFile(t, secret, "SECRETLINE;\n")
+	writeFile(t, filepath.Join(root, "lib.mp"), "numeric libvalue; libvalue := 7;\n")
+	@<Make |page| with the two attacks on |secret| and the sibling input@>
+	@<Check that the unconfined engine leaks the secret@>
+	@<Check that the confined engine leaks nothing and still reads the sibling@>
+}
+
+@ @<Make |page| with the two attacks...@>=
+page := `<metapost>input ` + secret + `; beginfig(1) draw origin; endfig;</metapost>` +
+	`<metapost>errmessage readfrom "` + secret + `"; beginfig(1) draw origin; endfig;</metapost>` +
+	`<metapost>input lib; beginfig(1) draw (0,0)--(libvalue,0); endfig;</metapost>`
+run := func(confine bool) (*Processor, string) {
+	p, err := New(Options{Root: root, Renderers: []*Renderer{MetaPost}, Confine: confine, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	htmldoc.Render(&b, process(t, p, page, Request{NoCache: true}))
+	return p, b.String()
+}
+
+@ @<Check that the unconfined engine leaks the secret@>=
+if _, out := run(false); strings.Count(out, "SECRETLINE") < 2 {
+	t.Fatalf("control: the unconfined engine did not read the secret twice: %q", out)
+}
+
+@ @<Check that the confined engine leaks nothing...@>=
+p, out := run(true)
+if p.self == "" {
+	t.Skip("this system cannot confine the engines")
+}
+if strings.Contains(out, "SECRETLINE") {
+	t.Errorf("the confined engine read the secret: %q", out)
+}
+if n := strings.Count(out, "<img"); n != 1 {
+	t.Errorf("got %d images, want 1, from the sibling input: %q", n, out)
 }
 
 @* Index.

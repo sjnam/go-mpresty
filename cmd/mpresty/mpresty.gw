@@ -40,16 +40,26 @@ import (
 )
 
 func main() {
+	render.RunConfined()
 	@<Parse the command line@>
 	@<Set up the logger |log|@>
 	@<Build the processor |proc| and the server |srv|@>
 	@<Serve on |*addr| until interrupted@>
 }
 
-@ Every flag has a default that suits the sample pages of the repository, so
+@ The call to |render.RunConfined| comes before anything else, because
+mpresty sometimes runs itself: to start an engine with its file reads
+confined, the renderer starts this program with the engine's arguments and a
+variable in its environment, and such a copy must confine itself and become
+the engine before it so much as looks at the command line. In an ordinary run
+the call returns at once.
+
+Every flag has a default that suits the sample pages of the repository, so
 \.{./mpresty} alone, run from the top of a checkout, serves them on port
 8080. Zero means ``choose for me'' for both \.{-jobs} and \.{-cache}; the packages
-that receive those numbers know what to choose.
+that receive those numbers know what to choose. Confinement is on by
+default; where the system cannot provide it, the renderer says so at startup
+and runs the engines without it.
 @<Parse the command line@>=
 var (
 	addr     = flag.String("addr", ":8080", "address to listen on")
@@ -58,6 +68,7 @@ var (
 	timeout  = flag.Duration("timeout", 30*time.Second, "wall clock budget for one engine run")
 	maxJobs  = flag.Int("jobs", 0, "concurrent engine runs (0 = GOMAXPROCS)")
 	cacheCap = flag.Int("cache", 0, "cache entries to keep (0 = default)")
+	confine  = flag.Bool("confine", true, "confine engine file reads to the document root (Linux)")
 	verbose  = flag.Bool("v", false, "log at debug level")
 )
 flag.Parse()
@@ -83,6 +94,7 @@ proc, err := render.New(render.Options{
 	Timeout: *timeout,
 	MaxJobs: *maxJobs,
 	Cache:   cache.New(*cacheCap),
+	Confine: *confine,
 	Logger:  log,
 })
 if err != nil {
