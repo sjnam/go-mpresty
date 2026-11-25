@@ -114,17 +114,25 @@ func (s *Server) page(up render.Updaters) http.HandlerFunc {
 			return
 		}
 		@<Read the page |uri| into |body|@>
+		var doc *htmldoc.Node
+		if err == nil {
+			doc, err = htmldoc.Parse(bytes.NewReader(body), s.rawTags...)
+		}
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
-		@<Render |body| with |up| and send it@>
+		@<Render |doc| with |up| and send it@>
 	}
 }
 
 @ The URI is made absolute and cleaned before it is joined to the root, so
 that no \.{..} can climb out of it. The check after the join is a second line
 of defence, and it also turns away the root itself, which is not a page.
+
+The page is parsed by the handler, with the graphics elements shielded, and
+only the tree goes on to be rendered. The preview below builds its tree
+without parsing anything, and that difference is the whole point of it.
 @<Read the page |uri| into |body|@>=
 name := filepath.Join(s.root, filepath.FromSlash(path.Clean("/"+strings.TrimPrefix(uri, "/"))))
 var body []byte
@@ -135,8 +143,8 @@ if strings.HasPrefix(name, s.root+string(os.PathSeparator)) {
 	err = fs.ErrPermission
 }
 
-@ @<Render |body| with |up| and send it@>=
-out, err := s.render(r, body, uri, up)
+@ @<Render |doc| with |up| and send it@>=
+out, err := s.render(r, doc, uri, up)
 if err != nil {
 	s.fail(w, r, err)
 	return
@@ -144,17 +152,13 @@ if err != nil {
 w.Header().Set("Content-Type", "text/html; charset=utf-8")
 w.Write(out)
 
-@ Rendering a page is parse, process, serialize. The query parameter
+@ Rendering a page is process, then serialize. The query parameter
 \.{?debug} rebuilds every image on the page, as it did in Lua; the request's
 context goes to the processor, so the engines stop working on a page as soon
 as its client hangs up.
 @<Functions@>=
-// render parses, renders and serializes one document.
-func (s *Server) render(r *http.Request, body []byte, uri string, up render.Updaters) ([]byte, error) {
-	doc, err := htmldoc.Parse(bytes.NewReader(body), s.rawTags...)
-	if err != nil {
-		return nil, err
-	}
+// render renders and serializes one document.
+func (s *Server) render(r *http.Request, doc *htmldoc.Node, uri string, up render.Updaters) ([]byte, error) {
 	req := render.Request{
 		BaseURI:  uri,
 		NoCache:  r.URL.Query().Has("debug"),
@@ -228,6 +232,9 @@ and runs it through the same pipeline as any page, which is what
 \.{preview.lua} did. The element turns the cache off, since an author
 previewing is about to change the code anyway, and asks for a width of 400.
 
+Anyone may post to this route, so whatever arrives in the form is hostile
+until proved otherwise.
+
 The graphics tag is checked against the registered renderers up front, so that
 the form cannot name an arbitrary element.
 @<Route \.{/preview.gxn}@>=
@@ -245,25 +252,49 @@ mux.HandleFunc("POST /preview.gxn", func(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "400 unknown graphics tag", http.StatusBadRequest)
 		return
 	}
-	@<Build the document |body| around the posted code@>
+	@<Build the document |doc| around the posted code@>
 	uri := "/preview.gxn"
 	up := render.Updaters{}
-	@<Render |body| with |up| and send it@>
+	@<Render |doc| with |up| and send it@>
 })
 
-@ The command, if any, becomes a \.{cmd} attribute. It reaches the engine as
-an element of an argument vector, never as a word for a shell, and the
-renderer's own list of commands has the final say.
-@<Build the document |body| around the posted code@>=
-var cmd string
-if c := r.PostFormValue("cmd"); c != "" {
-	cmd = fmt.Sprintf(" cmd=%q", c)
+@ Until November 2026 this handler did what \.{preview.lua} had done: it
+pasted the form's fields into a string of HTML,
+$$\hbox{\.{<metapost cmd="mpost" cache='no' width='400'>}\it code\/\.{</metapost>}}$$
+and parsed it like any page. That let the poster write markup as well as
+graphics. A code field of \.{x</metapost><img src="http://10.0.0.1/a.mp">}
+closes the element early and adds an image whose source is remote, and the
+renderer obligingly fetched it: from the server, on the poster's behalf, from
+any host the server can reach and the poster cannot. That is server-side
+request forgery. The command field allowed the same through a stray quote,
+and quoting it with \.{\%q} did not help, since \GO/'s escapes are not
+HTML's. Shielding was no defence either, because the code chose where the
+element ended.
+
+So the document is no longer written as text. An empty document comes from
+the parser, which supplies \.{<html>}, \.{<head>} and \.{<body>}, and the
+graphics element is built as a node and hung in the body. Each field goes to
+one place and is never parsed: the command is the value of one attribute, the
+code is one text node, which is exactly what the renderer would have found
+inside a shielded element. No field can add an element or an attribute, so in
+particular none can add a \.{src}, and the preview reads no source but the
+one posted to it. The renderer's own list of commands still has the final say
+on \.{cmd}, which reaches the engine as an element of an argument vector,
+never as a word for a shell.
+@<Build the document |doc| around the posted code@>=
+doc, err := htmldoc.Parse(strings.NewReader(""))
+if err != nil {
+	s.fail(w, r, err)
+	return
 }
-body := []byte(strings.Join([]string{
-	"<", gx, cmd, " cache='no' width='400'>\n",
-	r.PostFormValue("code"),
-	"\n</", gx, ">",
-}, ""))
+el := htmldoc.CreateElement(gx)
+if c := r.PostFormValue("cmd"); c != "" {
+	htmldoc.SetAttr(el, "cmd", c)
+}
+htmldoc.SetAttr(el, "cache", "no")
+htmldoc.SetAttr(el, "width", "400")
+htmldoc.SetTextContent(el, r.PostFormValue("code"))
+htmldoc.Elements(doc, "body")[0].AppendChild(el)
 
 @* Updaters.
 The Lua version let a page customize its rewrite by dropping a \.{.lua} file
@@ -316,6 +347,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sjnam/go-mpresty/internal/render"
@@ -449,16 +481,23 @@ func TestUpdatenodeUsesPerTagUpdaters(t *testing.T) {
 	}
 }
 
-@ The preview gets code with a \.{<} in it, which must survive the trip
-through the synthesized document, and comes back as an image 400 wide.
-@(server_test.go@>=
-func TestPreviewRendersPostedCode(t *testing.T) {
-	h := newServer(t, nil)
-	form := url.Values{"gx": {"fake"}, "cmd": {"cp"}, "code": {"if a<b: draw x;"}}
+@ The preview tests post a form, through one more helper.
+@<Test helpers@>=
+func post(t *testing.T, h http.Handler, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/preview.gxn", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	h.ServeHTTP(rec, req)
+	return rec
+}
+
+@ The preview gets code with a \.{<} in it, which must survive the trip
+into the document, and comes back as an image 400 wide.
+@(server_test.go@>=
+func TestPreviewRendersPostedCode(t *testing.T) {
+	h := newServer(t, nil)
+	rec := post(t, h, url.Values{"gx": {"fake"}, "cmd": {"cp"}, "code": {"if a<b: draw x;"}})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
 	}
@@ -471,13 +510,47 @@ func TestPreviewRendersPostedCode(t *testing.T) {
 @(server_test.go@>=
 func TestPreviewRejectsUnknownTag(t *testing.T) {
 	h := newServer(t, nil)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/preview.gxn", strings.NewReader("gx=evil&code=x"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
+	if rec := post(t, h, url.Values{"gx": {"evil"}, "code": {"x"}}); rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
+}
+
+@ This test is the reason for the preview's present shape. A second server
+stands in for a host inside the network that mpresty can reach and the
+attacker cannot, and counts the requests it gets. Two posts try to make
+mpresty fetch from it: one closes the graphics element inside the code and
+opens an \.{<img>} with a remote \.{src}, the other smuggles a \.{src}
+attribute in through the command. The renderer fetches a source before it
+checks the command, so either would reach the host if the posted text were
+ever read as HTML. Neither may.
+@(server_test.go@>=
+func TestPreviewCannotReachOtherHosts(t *testing.T) {
+	var hits atomic.Int32
+	inside := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		io.WriteString(w, "secret")
+	}))
+	defer inside.Close()
+	h := newServer(t, nil)
+	@<Post the two attacks on |inside| to |h|@>
+	if n := hits.Load(); n != 0 {
+		t.Errorf("the preview made %d requests to another host", n)
+	}
+}
+
+@ Each attack must still get an ordinary answer: the first renders its
+code, tags and all, as one picture; the second is refused for its strange
+command.
+@<Post the two attacks on |inside| to |h|@>=
+code := `x</fake><img src="` + inside.URL + `/a.txt"><fake>`
+rec := post(t, h, url.Values{"gx": {"fake"}, "code": {code}})
+if n := strings.Count(rec.Body.String(), "<img"); rec.Code != http.StatusOK || n != 1 {
+	t.Errorf("code injection: status %d, %d images, body %q", rec.Code, n, rec.Body.String())
+}
+cmd := `cp" src=` + inside.URL + `/b.txt x="`
+rec = post(t, h, url.Values{"gx": {"fake"}, "cmd": {cmd}, "code": {"x"}})
+if body := rec.Body.String(); rec.Code != http.StatusOK || !strings.Contains(body, "not allowed") {
+	t.Errorf("command injection: status %d, body %q", rec.Code, body)
 }
 
 @* Index.
