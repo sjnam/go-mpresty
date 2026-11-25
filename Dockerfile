@@ -3,6 +3,11 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# The Go sources are tangled from the .gw literate programs, by the gtangle
+# that go.mod pins as a tool.
+RUN for w in $(find cmd internal -name '*.gw'); do \
+      (cd "$(dirname "$w")" && go tool gtangle "$(basename "$w")") || exit 1; \
+    done
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mpresty ./cmd/mpresty
 
 FROM ubuntu:resolute

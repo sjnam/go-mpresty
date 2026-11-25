@@ -10,9 +10,12 @@ same thing with OpenResty and Lua. It keeps the page syntax, the routes and the
 ## Getting started
 
 ```bash
-go build -o mpresty ./cmd/mpresty
+make build
 ./mpresty -root webapp/html
 ```
+
+`make build` first tangles the Go sources out of the `.gw` files (see
+[Literate source](#literate-source)); it needs nothing but Go.
 
 Or with Docker, which brings the engines with it:
 
@@ -163,17 +166,21 @@ webapp/html/      the sample pages, carried over unchanged
 
 Each Go directory above holds a single [GWEB](https://github.com/sjnam/gweb)
 literate program, `<name>.gw`, from which `gtangle` produces `<name>.go` and,
-for the packages that have tests, `<name>_test.go`. The `.gw` files are the
-source; edit them, not the Go files.
+for the packages that have tests, `<name>_test.go`. Only the `.gw` files are
+in the repository; the Go files are generated, by `make` here and by the
+Dockerfile in the image.
 
 ```bash
 make tangle   # .gw -> .go and _test.go
-make doc      # typeset each .gw as a PDF next to it (needs LuaTeX)
+make test     # tangles first, as build, vet and race do
+make doc      # typeset each .gw as a PDF next to it (needs gweave and LuaTeX)
 ```
 
-The tangled Go files are committed as well, so `go build`, `go install` and
-the Dockerfile need nothing but Go. The `//line` comments in them point
-compiler errors and stack traces back at the `.gw` files.
+`gtangle` is pinned by the `tool` directive in `go.mod` and runs as
+`go tool gtangle`, so no separate installation is needed. After a fresh
+clone, run `make tangle` before `go build`, `go test` or an editor can see
+the code. The `//line` comments in the tangled files point compiler errors
+and stack traces back at the `.gw` files.
 
 ## License
 

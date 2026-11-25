@@ -2,7 +2,10 @@
 /dist/
 webapp/html/images/
 
-# gweave and TeX output; the .gw files are the source
+# Tangled from the .gw files by `make tangle`
+*.go
+
+# gweave and TeX output
 *.tex
 *.log
 *.toc

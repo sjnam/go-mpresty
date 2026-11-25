@@ -2,6 +2,8 @@
 /mpresty
 /dist
 webapp/html/images
+# The image tangles its own Go files from the .gw sources.
+*.go
 *.tex
 *.log
 *.toc

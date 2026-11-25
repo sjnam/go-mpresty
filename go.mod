@@ -6,3 +6,7 @@ require (
 	golang.org/x/net v0.58.0
 	golang.org/x/sync v0.22.0
 )
+
+require github.com/sjnam/gweb v0.11.0 // indirect
+
+tool github.com/sjnam/gweb/cmd/gtangle
