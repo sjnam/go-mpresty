@@ -1,0 +1,37 @@
+% The @@s directives shared by every web in mpresty: each one tells gweave
+% to set an imported type in bold, as it sets the types a web declares.
+% A web reads this file with @@i ../../types.gw at the top of its limbo.
+% Qualified names make gweave bold only pkg.Name used as a type, and
+% never a field or method that happens to share the name.
+
+@s bytes.Buffer int
+@s cache.Cache int
+@s context.Context int
+@s html.Attribute int
+@s htmldoc.Node int
+@s http.Client int
+@s http.Handler int
+@s http.HandlerFunc int
+@s http.Request int
+@s http.Response int
+@s http.ResponseWriter int
+@s http.Server int
+@s httptest.ResponseRecorder int
+@s io.Reader int
+@s io.Writer int
+@s list.Element int
+@s list.List int
+@s render.Processor int
+@s render.Renderer int
+@s render.Request int
+@s render.UpdateNodeFunc int
+@s render.Updaters int
+@s singleflight.Group int
+@s slog.HandlerOptions int
+@s slog.Logger int
+@s strings.Builder int
+@s sync.Mutex int
+@s sync.WaitGroup int
+@s testing.T int
+@s time.Duration int
+@s url.Values int

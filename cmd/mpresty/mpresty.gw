@@ -1,7 +1,6 @@
 \def\title{MPRESTY}
 
-@s HandlerOptions int
-@s Server int
+@i ../../types.gw
 
 @* Introduction.
 This is the command \.{mpresty}, which serves a document root and turns the

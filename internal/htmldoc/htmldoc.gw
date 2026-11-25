@@ -1,10 +1,6 @@
 \def\title{HTMLDOC}
 
-@s Reader int
-@s Writer int
-@s Attribute int
-@s Builder int
-@s T int
+@i ../../types.gw
 
 @* Introduction.
 The OpenResty version of mpresty read its pages with {\it gumbo}, Google's

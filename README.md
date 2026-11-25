@@ -176,6 +176,11 @@ make test     # tangles first, as build, vet and race do
 make doc      # typeset each .gw as a PDF next to it (needs gweave and LuaTeX)
 ```
 
+The `@s` directives that tell `gweave` which imported types to set in bold
+are shared: they live in `types.gw` at the top of the repository, and every
+web reads it with `@i ../../types.gw` (GWEB resolves `@i` against the
+including file's directory).
+
 `gtangle` is pinned by the `tool` directive in `go.mod` and runs as
 `go tool gtangle`, so no separate installation is needed. After a fresh
 clone, run `make tangle` before `go build`, `go test` or an editor can see

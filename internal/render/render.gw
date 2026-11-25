@@ -1,16 +1,6 @@
 \def\title{RENDER}
 
-@s Context int
-@s Duration int
-@s Logger int
-@s Client int
-@s Group int
-@s Node int
-@s Cache int
-@s Buffer int
-@s Response int
-@s T int
-@s Builder int
+@i ../../types.gw
 
 @* Introduction.
 Some years ago I wrote mpresty, a small web application on OpenResty, which

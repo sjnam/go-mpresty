@@ -1,18 +1,6 @@
 \def\title{SERVER}
 
-@s Processor int
-@s Logger int
-@s Handler int
-@s HandlerFunc int
-@s ResponseWriter int
-@s Request int
-@s Updaters int
-@s UpdateNodeFunc int
-@s Node int
-@s Renderer int
-@s Values int
-@s ResponseRecorder int
-@s T int
+@i ../../types.gw
 
 @* Introduction.
 In the OpenResty version of mpresty the web server was nginx itself, and its
