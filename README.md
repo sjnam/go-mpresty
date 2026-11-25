@@ -195,7 +195,8 @@ including file's directory).
 `gtangle` is pinned by the `tool` directive in `go.mod` and runs as
 `go tool gtangle`, so no separate installation is needed. After a fresh
 clone, run `make tangle` before `go build`, `go test` or an editor can see
-the code. The `//line` comments in the tangled files point compiler errors
+the code. For the same reason run `make tidy`, never a bare `go mod tidy`:
+without the tangled files tidy sees no imports and empties `go.mod`. The `//line` comments in the tangled files point compiler errors
 and stack traces back at the `.gw` files.
 
 ## License

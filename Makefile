@@ -10,6 +10,10 @@
 #   make doc      typeset each .gw as a .pdf next to it
 #   make build    the mpresty binary
 #   make test     go test ./...
+#   make tidy     go mod tidy, on tangled sources
+#
+# Never run a bare `go mod tidy` before `make tangle`: with no Go files to
+# read, tidy drops every requirement from go.mod, and the Docker build fails.
 
 BIN  := mpresty
 ROOT := webapp/html
@@ -23,7 +27,7 @@ WEBS := cmd/mpresty/mpresty internal/cache/cache internal/htmldoc/htmldoc \
         internal/render/render internal/server/server
 GOSRC := $(addsuffix .go,$(WEBS))
 
-.PHONY: all tangle doc build test race vet run clean docker
+.PHONY: all tangle doc build test race vet tidy run clean docker
 
 all: build
 
@@ -56,13 +60,19 @@ race: tangle
 vet: tangle
 	go vet ./...
 
+tidy: tangle
+	go mod tidy
+
 run: build
 	./$(BIN) -root $(ROOT)
 
+# Every Go file under cmd/ and internal/ is tangled, including the extra
+# files a web writes with @(...@>=, such as render's confine_linux.go.
 clean:
 	rm -rf $(BIN) $(ROOT)/images
+	find cmd internal -name '*.go' -delete
 	@for w in $(WEBS); do \
-	  rm -f $$w.go $${w}_test.go $$w.tex $$w.log $$w.toc $$w.idx $$w.scn $$w.pdf; done
+	  rm -f $$w.tex $$w.log $$w.toc $$w.idx $$w.scn $$w.pdf; done
 
 docker:
 	docker build -t mpresty:latest .
