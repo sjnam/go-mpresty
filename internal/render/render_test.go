@@ -1,9 +1,13 @@
+//line render.gw:695
 package render
 
 import (
 	"context"
 	"hash/crc32"
+	"io"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -12,10 +16,10 @@ import (
 	"github.com/sjnam/go-mpresty/internal/htmldoc"
 )
 
-// fake is an engine that needs no TeX installed: it copies its source file to
-// the SVG the pipeline expects, so tests exercise the plumbing, not MetaPost.
-func fake() *Renderer {
-	return &Renderer{
+//line render.gw:717
+func newProcessor(t *testing.T, root string) *Processor {
+	t.Helper()
+	fake := &Renderer{
 		Tag:       "fake",
 		Ext:       "txt",
 		Cmd:       "cp",
@@ -26,17 +30,18 @@ func fake() *Renderer {
 			return []string{"cp", fname + ".txt", fname + ".svg"}
 		},
 	}
-}
-
-func newProcessor(t *testing.T, root string) *Processor {
-	t.Helper()
-	p, err := New(Options{Root: root, Renderers: []*Renderer{fake()}, Logger: quietLogger()})
+	p, err := New(Options{Root: root, Renderers: []*Renderer{fake}, Logger: quietLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return p
 }
 
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+//line render.gw:743
 func process(t *testing.T, p *Processor, html string, req Request) *htmldoc.Node {
 	t.Helper()
 	doc, err := htmldoc.Parse(strings.NewReader(html), p.RawTags()...)
@@ -52,33 +57,62 @@ func process(t *testing.T, p *Processor, html string, req Request) *htmldoc.Node
 	return doc
 }
 
+//line render.gw:761
+func crcOf(s string) string {
+	return strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(s))), 10)
+}
+
+//line render.gw:768
+func writeFile(t *testing.T, name, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readFile(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+//line render.gw:1003
+func requireCommand(t *testing.T, name string) {
+	t.Helper()
+	if _, err := exec.LookPath(name); err != nil {
+		t.Skipf("%s is not installed", name)
+	}
+}
+
+//line render.gw:791
 func TestRendersInlineSource(t *testing.T) {
 	root := t.TempDir()
 	p := newProcessor(t, root)
-
 	doc := process(t, p, `<fake width="120">hello</fake>`, Request{})
 	img := htmldoc.Elements(doc, "img")
 	if len(img) != 1 {
 		t.Fatalf("got %d img elements, want 1", len(img))
 	}
 	src, _ := htmldoc.Attr(img[0], "src")
-	want := "/images/cp" + crcOf("hello") + ".svg"
-	if src != want {
+	if want := "/images/cp" + crcOf("hello") + ".svg"; src != want {
 		t.Errorf("src = %q, want %q", src, want)
 	}
 	if w, _ := htmldoc.Attr(img[0], "width"); w != "120" {
 		t.Errorf("width = %q, want the author's 120", w)
 	}
-	// The engine saw preamble and postamble wrapped around the source.
-	b, err := os.ReadFile(filepath.Join(root, "images", "cp"+crcOf("hello")+".svg"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(b); got != "P:hello:Q" {
+	got := readFile(t, filepath.Join(root, "images", "cp"+crcOf("hello")+".svg"))
+	if got != "P:hello:Q" {
 		t.Errorf("engine input = %q, want %q", got, "P:hello:Q")
 	}
 }
 
+//line render.gw:814
 func TestDefaultWidthWhenAuthorGivesNone(t *testing.T) {
 	p := newProcessor(t, t.TempDir())
 	doc := process(t, p, `<fake>x</fake>`, Request{})
@@ -87,12 +121,11 @@ func TestDefaultWidthWhenAuthorGivesNone(t *testing.T) {
 	}
 }
 
-// The <img src="....txt"> form must render just like the custom element.
+//line render.gw:825
 func TestRendersImgBySourceExtension(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "source", "a.txt"), "from-file")
 	p := newProcessor(t, root)
-
 	doc := process(t, p, `<img src="/source/a.txt" width="90">`, Request{})
 	src, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "src")
 	if want := "/images/cp" + crcOf("from-file") + ".svg"; src != want {
@@ -100,12 +133,10 @@ func TestRendersImgBySourceExtension(t *testing.T) {
 	}
 }
 
-// A relative src resolves against the directory of the page, as it did in Lua.
 func TestRelativeSourceResolvesAgainstPage(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "docs", "b.txt"), "sibling")
 	p := newProcessor(t, root)
-
 	doc := process(t, p, `<img src="b.txt">`, Request{BaseURI: "/docs/index.html"})
 	src, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "src")
 	if want := "/images/cp" + crcOf("sibling") + ".svg"; src != want {
@@ -113,13 +144,11 @@ func TestRelativeSourceResolvesAgainstPage(t *testing.T) {
 	}
 }
 
-// A traversing src must never reach outside the document root. Cleaning the
-// URI as an absolute path neutralises it, so the file simply is not there.
+//line render.gw:852
 func TestTraversingSourceStaysInsideRoot(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(filepath.Dir(root), "secret.txt"), "outside")
 	p := newProcessor(t, root)
-
 	doc := process(t, p, `<img src="/../secret.txt">`, Request{})
 	pre := htmldoc.Elements(doc, "pre")
 	if len(pre) != 1 {
@@ -133,7 +162,7 @@ func TestTraversingSourceStaysInsideRoot(t *testing.T) {
 	}
 }
 
-// resolve keeps the guard for callers that pass a path not rooted by Clean.
+//line render.gw:872
 func TestResolveRefusesEscape(t *testing.T) {
 	p := newProcessor(t, t.TempDir())
 	if _, err := p.resolve("../../etc/passwd", ""); err == nil {
@@ -144,8 +173,7 @@ func TestResolveRefusesEscape(t *testing.T) {
 	}
 }
 
-// A cmd attribute picks the engine binary, so it must be bounded by the
-// renderer's allow-list — the Lua version pasted it into a shell string.
+//line render.gw:885
 func TestRejectsDisallowedCommand(t *testing.T) {
 	p := newProcessor(t, t.TempDir())
 	doc := process(t, p, `<fake cmd="rm">x</fake>`, Request{})
@@ -158,31 +186,32 @@ func TestRejectsDisallowedCommand(t *testing.T) {
 	}
 }
 
-// An already rendered file is reused untouched; ?debug and cache="no" rebuild.
+//line render.gw:901
 func TestCacheReusesRenderedFile(t *testing.T) {
 	root := t.TempDir()
 	p := newProcessor(t, root)
 	svg := filepath.Join(root, "images", "cp"+crcOf("keep")+".svg")
 	writeFile(t, svg, "SENTINEL")
-
 	process(t, p, `<fake>keep</fake>`, Request{})
 	if got := readFile(t, svg); got != "SENTINEL" {
 		t.Errorf("cached file was rebuilt: %q", got)
 	}
 
+//line render.gw:914
 	process(t, p, `<fake>keep</fake>`, Request{NoCache: true})
 	if got := readFile(t, svg); got != "P:keep:Q" {
 		t.Errorf("NoCache did not rebuild: %q", got)
 	}
-
 	writeFile(t, svg, "SENTINEL")
 	process(t, p, `<fake cache="no">keep</fake>`, Request{})
 	if got := readFile(t, svg); got != "P:keep:Q" {
 		t.Errorf(`cache="no" did not rebuild: %q`, got)
 	}
+
+//line render.gw:911
 }
 
-// The attributes the pipeline consumes must not survive into the output.
+//line render.gw:926
 func TestConsumedAttributesAreRemoved(t *testing.T) {
 	p := newProcessor(t, t.TempDir())
 	doc := process(t, p, `<fake cmd="cp" cache="no" width="50">x</fake>`, Request{})
@@ -194,6 +223,7 @@ func TestConsumedAttributesAreRemoved(t *testing.T) {
 	}
 }
 
+//line render.gw:940
 func TestUpdatersSelectPerTag(t *testing.T) {
 	p := newProcessor(t, t.TempDir())
 	req := Request{Updaters: Updaters{ByTag: map[string]UpdateNodeFunc{
@@ -212,15 +242,12 @@ func TestUpdatersSelectPerTag(t *testing.T) {
 	}
 }
 
-// Many nodes at once is the whole point of the port; run this under -race.
+//line render.gw:963
 func TestConcurrentNodes(t *testing.T) {
-	root := t.TempDir()
-	p := newProcessor(t, root)
+	p := newProcessor(t, t.TempDir())
 	var b strings.Builder
 	for i := range 40 {
-		b.WriteString("<fake>n")
-		b.WriteString(strconv.Itoa(i))
-		b.WriteString("</fake>")
+		b.WriteString("<fake>n" + strconv.Itoa(i) + "</fake>")
 	}
 	doc := process(t, p, b.String(), Request{})
 	if n := len(htmldoc.Elements(doc, "img")); n != 40 {
@@ -231,7 +258,7 @@ func TestConcurrentNodes(t *testing.T) {
 	}
 }
 
-// Two documents racing on the same source must not fight over the same file.
+//line render.gw:979
 func TestConcurrentIdenticalSources(t *testing.T) {
 	root := t.TempDir()
 	p := newProcessor(t, root)
@@ -246,13 +273,99 @@ func TestConcurrentIdenticalSources(t *testing.T) {
 	for range 8 {
 		<-done
 	}
-	if got := readFile(t, filepath.Join(root, "images", "cp"+crcOf("same")+".svg")); got != "P:same:Q" {
+	svg := filepath.Join(root, "images", "cp"+crcOf("same")+".svg")
+	if got := readFile(t, svg); got != "P:same:Q" {
 		t.Errorf("svg = %q", got)
 	}
 }
 
-// crcOf mirrors how the pipeline names a file: the CRC-32 of the source
-// itself, before preamble and postamble are wrapped around it.
-func crcOf(s string) string {
-	return strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(s))), 10)
+//line render.gw:1013
+func TestMetaPostEndToEnd(t *testing.T) {
+	requireCommand(t, "mpost")
+	p, err := New(Options{Root: t.TempDir(), Renderers: []*Renderer{MetaPost}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `<metapost width="100">
+beginfig(1)
+  n:=3;
+  if n<5: draw fullcircle scaled 2cm; fi
+  label("n = "&decimal n, origin);
+endfig;
+</metapost>`
+	doc, err := htmldoc.Parse(strings.NewReader(src), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+//line render.gw:1034
+	if err := p.Process(context.Background(), doc, Request{BaseURI: "/p.html"}); err != nil {
+		t.Fatal(err)
+	}
+	if pre := htmldoc.Elements(doc, "pre"); len(pre) > 0 {
+		t.Fatalf("mpost failed: %s", htmldoc.TextContent(pre[0]))
+	}
+	img := htmldoc.Elements(doc, "img")
+	if len(img) != 1 {
+		t.Fatalf("got %d img elements, want 1", len(img))
+	}
+	uri, _ := htmldoc.Attr(img[0], "src")
+	if !strings.HasPrefix(uri, "/images/mpost") || !strings.HasSuffix(uri, ".svg") {
+		t.Errorf("src = %q", uri)
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(uri, "/images/"), ".svg")
+	if got := readFile(t, p.svgPath(name)); !strings.Contains(got, "<svg") {
+		t.Errorf("output is not an SVG: %.60q", got)
+	}
+
+//line render.gw:1031
+}
+
+//line render.gw:1055
+func TestGraphvizEndToEnd(t *testing.T) {
+	requireCommand(t, "dot")
+	p, err := New(Options{Root: t.TempDir(), Renderers: []*Renderer{Graphviz}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := htmldoc.Parse(strings.NewReader(`<graphviz cmd="neato">digraph{a->b->c}</graphviz>`), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Process(context.Background(), doc, Request{BaseURI: "/p.html"}); err != nil {
+		t.Fatal(err)
+	}
+	if pre := htmldoc.Elements(doc, "pre"); len(pre) > 0 {
+		t.Fatalf("dot failed: %s", htmldoc.TextContent(pre[0]))
+	}
+	if s, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "src"); !strings.HasPrefix(s, "/images/neato") {
+		t.Errorf("src = %q, want the cmd attribute to pick neato", s)
+	}
+}
+
+//line render.gw:1079
+func TestEngineFailureBecomesVisibleError(t *testing.T) {
+	requireCommand(t, "mpost")
+	p, err := New(Options{Root: t.TempDir(), Renderers: []*Renderer{MetaPost}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `<metapost>this is not metapost at all (((</metapost>`
+	doc, err := htmldoc.Parse(strings.NewReader(src), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Process(context.Background(), doc, Request{BaseURI: "/p.html"}); err != nil {
+		t.Fatal(err)
+	}
+	pre := htmldoc.Elements(doc, "pre")
+	if len(pre) != 1 {
+		t.Fatalf("got %d error nodes, want 1", len(pre))
+	}
+	if style, _ := htmldoc.Attr(pre[0], "style"); style != "color:red" {
+		t.Errorf("style = %q", style)
+	}
+	if got := htmldoc.TextContent(pre[0]); !strings.Contains(got, "mpost") {
+		t.Errorf("error text does not name the engine: %q", got)
+	}
 }

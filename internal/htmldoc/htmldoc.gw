@@ -1,0 +1,399 @@
+\def\title{HTMLDOC}
+
+@s Reader int
+@s Writer int
+@s Attribute int
+@s Builder int
+@s T int
+
+@* Introduction.
+The OpenResty version of mpresty read its pages with {\it gumbo}, Google's
+HTML5 parser, through a Lua binding that offered a small DOM in the browser's
+image: |getElementsByTagName|, |textContent|, |setAttribute|, |serialize|.
+The \GO/ port reads them with the package \.{golang.org/x/net/html}, which
+parses as faithfully as gumbo did but leaves its tree bare: a |Node| has
+pointers to its parent, children and siblings, a slice of attributes, and
+nothing else. This package supplies the handful of helpers the renderer and
+the server need on top of it, so that neither of them has to import
+\.{x/net/html} itself.
+
+It also solves a problem that gumbo never did, and that is the main reason it
+deserves a document of its own. An HTML5 tokenizer reads \.{<} followed by a
+letter as the start of a tag, so the MetaPost line
+$$\hbox{\.{if a<b: draw z1--z2; fi}}$$
+inside a \.{<metapost>} element loses everything from the \.{<} onward. The
+original mpresty inherited that from gumbo, and an author who compared two
+variables in a figure got a mysterious MetaPost error about an incomplete
+|if|. The part on parsing below tells how the bodies of graphics elements
+now reach the engine byte for byte.
+
+@ The skeleton of the package.
+@c
+// Package htmldoc wraps golang.org/x/net/html with the DOM helpers
+// mpresty needs, and parses graphics source without mangling it.
+package htmldoc
+
+import (
+	"crypto/rand"
+	"io"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
+)
+
+@<Types and constants@>
+@<Functions@>
+
+@ Callers see the parser's node type under a name of our own. It is an
+alias, not a new type, so the two are interchangeable and nothing needs
+converting. The two node kinds callers ever ask about are renamed along with
+it.
+@<Types and constants@>=
+// Node is an alias so callers need not import x/net/html directly.
+type Node = html.Node
+
+// Node types re-exported for callers of Walk.
+const (
+	TextNode    = html.TextNode
+	ElementNode = html.ElementNode
+)
+
+@* Parsing with shielded bodies.
+An HTML parser already knows elements whose content is not HTML. The body of
+a \.{<script>} or a \.{<style>} is {\it raw text\/}: the tokenizer stops
+looking for tags inside it until it meets the matching end tag. Graphics
+elements deserve the same treatment, but the tokenizer's list of raw text
+elements is fixed in the standard and in the code, and \.{<metapost>} is not
+on it.
+
+So |Parse| takes the names of the raw elements as an argument and does the
+shielding itself. Before parsing, each body is lifted out and replaced by an
+opaque token; after parsing, each token, now a text node in the tree, is
+replaced by the body it stands for. The token is a run of letters and digits,
+so neither the tokenizer nor the entity decoder can alter it on its way
+through the parser.
+
+A consequence is that entities inside a graphics element are no longer
+decoded, so a MetaPost author writes \.{\&}, not \.{\&amp;}. That is what an
+author would expect of source code anyway, and it is what the \.{<script>}
+analogy predicts.
+@<Functions@>=
+// Parse reads an HTML document, shielding the bodies of rawTags from
+// the tokenizer.
+func Parse(r io.Reader, rawTags ...string) (*Node, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	src, bodies := string(b), make(map[string]string)
+	if len(rawTags) > 0 && strings.Contains(src, "<") {
+		@<Lift the body of every raw element out of |src| into |bodies|@>
+	}
+	doc, err := html.Parse(strings.NewReader(src))
+	if err != nil {
+		return nil, err
+	}
+	if len(bodies) > 0 {
+		@<Put every body in |bodies| back into |doc|@>
+	}
+	return doc, nil
+}
+
+@ A regular expression finds each raw element: its start tag (with whatever
+attributes), its body, and its end tag. The body is matched lazily so that
+two elements in a row are two matches, not one long one. Flag \.{s} lets
+\.{.}\ match a newline, since figures span many lines, and flag \.{i}
+accepts \.{<MetaPost>} as HTML would. An element with an empty body, such as
+\.{<metapost src="tree.mp"></metapost>}, is left alone; there is nothing to
+protect.
+
+Every token begins with a prefix drawn at random for this call, followed by
+a serial number. The randomness is cheap insurance against a page that
+happens to contain a word looking like a token; a fixed prefix would make
+that a matter of luck, a fresh random one makes it a matter of probability
+$2^{-130}$. The function |rand.Text|, new in \GO/~1.24, returns 26 characters
+from the base-32 alphabet, letters and digits only, which is just what we
+need. (My first version encoded eight random bytes in hex, and had to decide
+what to do if the operating system ever refused to supply them. |rand.Text|
+cannot fail.)
+@<Lift the body of every raw element out of |src| into |bodies|@>=
+prefix := "mprestyraw" + rand.Text()
+for _, tag := range rawTags {
+	q := regexp.QuoteMeta(tag)
+	re := regexp.MustCompile(`(?is)(<` + q + `\b[^<>]*>)(.*?)(</` + q + `\s*>)`)
+	src = re.ReplaceAllStringFunc(src, func(m string) string {
+		g := re.FindStringSubmatch(m)
+		if g[2] == "" {
+			return m
+		}
+		token := prefix + strconv.Itoa(len(bodies))
+		bodies[token] = g[2]
+		return g[1] + token + g[3]
+	})
+}
+
+@ Putting the bodies back is a walk over the text nodes. The parser hands a
+token back exactly as it received it, but I compare after trimming white
+space all the same, so that the restoration does not depend on the parser
+never merging a token with a neighbouring blank.
+@<Put every body in |bodies| back into |doc|@>=
+Walk(doc, func(n *Node) {
+	if n.Type == TextNode {
+		if body, ok := bodies[strings.TrimSpace(n.Data)]; ok {
+			n.Data = body
+		}
+	}
+})
+
+@ Serializing needs no help from us. The function is here only so that its
+callers can do without \.{x/net/html}. An earlier draft also had a
+|ParseFragment| that nobody called and a |String| that only a test called;
+both are gone.
+@<Functions@>=
+// Render serializes the tree back to HTML.
+func Render(w io.Writer, n *Node) error { return html.Render(w, n) }
+
+@* Walking the tree.
+Everything else in this package is a walk over the tree or a fiddle with one
+node. The walk visits a node before its children and the children in order,
+which is document order. It is recursive, but the depth of an HTML tree is
+the nesting depth of its markup, so the stack is in no danger.
+@<Functions@>=
+// Walk calls fn for n and every descendant, in document order.
+func Walk(n *Node, fn func(*Node)) {
+	fn(n)
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		Walk(c, fn)
+	}
+}
+
+@ Gumbo's |getElementsByTagName| returned a live collection. Ours returns a
+snapshot, and that matters: the renderer rewrites the nodes it gets back,
+renaming a \.{<metapost>} to an \.{<img>}, and it would not do to have the
+collection change under its feet while it iterates.
+@<Functions@>=
+// Elements collects every element with the given tag name. The result is
+// a snapshot, so callers may rewrite the nodes it holds while iterating.
+func Elements(n *Node, name string) []*Node {
+	var out []*Node
+	Walk(n, func(n *Node) {
+		if n.Type == ElementNode && n.Data == name {
+			out = append(out, n)
+		}
+	})
+	return out
+}
+
+@ The text of a node is the concatenation of the text nodes below it, as in
+the browser's |textContent|. For a graphics element it is the graphics
+source.
+@<Functions@>=
+// TextContent concatenates the text of n and its descendants.
+func TextContent(n *Node) string {
+	var b strings.Builder
+	Walk(n, func(n *Node) {
+		if n.Type == TextNode {
+			b.WriteString(n.Data)
+		}
+	})
+	return b.String()
+}
+
+@* Changing a node.
+Once its image is ready, a graphics node is turned into something else,
+usually an \.{<img>}. The helpers below do what the Lua updaters did through
+gumbo's DOM. Setting the text of a node replaces all of its children, exactly
+as assigning to |textContent| does in a browser.
+@<Functions@>=
+// SetTextContent replaces the children of n with a single text node.
+func SetTextContent(n *Node, s string) {
+	RemoveChildren(n)
+	n.AppendChild(&Node{Type: TextNode, Data: s})
+}
+
+@ Removing children one by one requires remembering the next sibling before
+the current child is cut loose, since |RemoveChild| clears its links.
+@<Functions@>=
+// RemoveChildren detaches every child of n.
+func RemoveChildren(n *Node) {
+	for c := n.FirstChild; c != nil; {
+		next := c.NextSibling
+		n.RemoveChild(c)
+		c = next
+	}
+}
+
+@ The parser identifies a known element by its |atom| as well as by its name,
+and code that inspects the tree usually compares atoms, which are integers,
+rather than names. The serializer happens to go by the name alone, so a node
+whose two fields disagree would print correctly and still be a trap for the
+next reader of the tree. A new or renamed element therefore gets both fields
+set together; |atom.Lookup| yields zero for a name that is not standard HTML,
+which is just what the parser gives a custom element.
+
+Renaming is the trick every Lua updater opened with,
+\.{node.localName = "img"}: the node keeps its attributes and its place in
+the tree and merely becomes another kind of element.
+@<Functions@>=
+// CreateElement builds a detached element.
+func CreateElement(name string) *Node {
+	return &Node{Type: ElementNode, Data: name, DataAtom: atom.Lookup([]byte(name))}
+}
+
+// Rename turns n into an element of another kind, keeping its attributes
+// and children.
+func Rename(n *Node, name string) {
+	n.Data, n.DataAtom = name, atom.Lookup([]byte(name))
+}
+
+@ Attributes are a slice of key--value pairs, and every helper is a linear
+search through it. An element has a handful of attributes, so nothing
+cleverer would pay.
+@<Functions@>=
+// Attr returns the value of an attribute and whether it was present.
+func Attr(n *Node, key string) (string, bool) {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val, true
+		}
+	}
+	return "", false
+}
+
+// AttrOr returns an attribute value, falling back to def when absent.
+func AttrOr(n *Node, key, def string) string {
+	if v, ok := Attr(n, key); ok {
+		return v
+	}
+	return def
+}
+
+// HasAttr reports whether the attribute is present.
+func HasAttr(n *Node, key string) bool {
+	_, ok := Attr(n, key)
+	return ok
+}
+
+@ Setting keeps an attribute where it was if it is already there, so that
+the serialized markup changes as little as possible.
+@<Functions@>=
+// SetAttr sets or replaces an attribute.
+func SetAttr(n *Node, key, val string) {
+	for i, a := range n.Attr {
+		if a.Key == key {
+			n.Attr[i].Val = val
+			return
+		}
+	}
+	n.Attr = append(n.Attr, html.Attribute{Key: key, Val: val})
+}
+
+// RemoveAttr drops an attribute if present.
+func RemoveAttr(n *Node, key string) {
+	for i, a := range n.Attr {
+		if a.Key == key {
+			n.Attr = append(n.Attr[:i], n.Attr[i+1:]...)
+			return
+		}
+	}
+}
+
+@* Tests.
+\.{GTANGLE} writes these to \.{htmldoc\_test.go}. The first test is the
+reason the package exists. Each case is a fragment that broke the
+gumbo-based original, together with the text the \.{<metapost>} element
+must come back with: a comparison, a string containing \.{<}, an ampersand
+both bare and as an entity, MetaPost's inequality \.{<>}, and a body spread
+over several lines.
+@(htmldoc_test.go@>=
+package htmldoc
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestParseShieldsRawBodies(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`<metapost>if a<b: draw z1--z2; fi</metapost>`, `if a<b: draw z1--z2; fi`},
+		{`<metapost>label("a<b", origin);</metapost>`, `label("a<b", origin);`},
+		{`<metapost>x:=a&b; y:=c&amp;d;</metapost>`, `x:=a&b; y:=c&amp;d;`},
+		{`<metapost>if n<>2: fi</metapost>`, `if n<>2: fi`},
+		{
+			"<metapost width=\"200\">\nbeginfig(1)\nendfig;\n</metapost>",
+			"\nbeginfig(1)\nendfig;\n",
+		},
+	}
+	for _, c := range cases {
+		@<Check that |c.in| parses to one \.{metapost} element holding |c.want|@>
+	}
+}
+
+@ @<Check that |c.in| parses...@>=
+doc, err := Parse(strings.NewReader(c.in), "metapost")
+if err != nil {
+	t.Fatalf("Parse(%q): %v", c.in, err)
+}
+els := Elements(doc, "metapost")
+if len(els) != 1 {
+	t.Fatalf("Parse(%q): got %d metapost elements, want 1", c.in, len(els))
+}
+if got := TextContent(els[0]); got != c.want {
+	t.Errorf("TextContent(%q) = %q, want %q", c.in, got, c.want)
+}
+
+@ Shielding must not disturb what it does not shield: an empty graphics
+element, the markup around it, and an \.{<img>} that merely points at a
+graphics source.
+@(htmldoc_test.go@>=
+func TestParseLeavesOrdinaryMarkupAlone(t *testing.T) {
+	const in = `<html><body><h1>t</h1><metapost src="tree.mp" width="200"></metapost>` +
+		`<img src="/source/rgb.mp" width="180"></body></html>`
+	doc, err := Parse(strings.NewReader(in), "metapost", "graphviz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(Elements(doc, "metapost")); n != 1 {
+		t.Errorf("metapost elements = %d, want 1", n)
+	}
+	if n := len(Elements(doc, "img")); n != 1 {
+		t.Errorf("img elements = %d, want 1", n)
+	}
+	if v, _ := Attr(Elements(doc, "metapost")[0], "src"); v != "tree.mp" {
+		t.Errorf("src = %q, want tree.mp", v)
+	}
+	if got := TextContent(Elements(doc, "h1")[0]); got != "t" {
+		t.Errorf("h1 text = %q, want t", got)
+	}
+}
+
+@ The last test does what an updater does, and checks the markup that comes
+out. The renamed element must serialize as a void \.{<img>}, with no end
+tag and without the attribute that was removed.
+@(htmldoc_test.go@>=
+func TestRenameAndAttrs(t *testing.T) {
+	doc, err := Parse(strings.NewReader(`<metapost width="200">code</metapost>`), "metapost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := Elements(doc, "metapost")[0]
+	RemoveChildren(n)
+	Rename(n, "img")
+	SetAttr(n, "src", "/images/x.svg")
+	RemoveAttr(n, "width")
+	if !HasAttr(n, "src") || HasAttr(n, "width") {
+		t.Fatalf("attrs = %v", n.Attr)
+	}
+	var b strings.Builder
+	if err := Render(&b, doc); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := b.String(), `<img src="/images/x.svg"/>`; !strings.Contains(got, want) {
+		t.Errorf("rendered %q, want it to contain %q", got, want)
+	}
+}
+
+@* Index.

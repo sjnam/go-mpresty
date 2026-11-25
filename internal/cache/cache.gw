@@ -1,0 +1,192 @@
+\def\title{CACHE}
+
+@s Mutex int
+@s List int
+@s Element int
+@s T int
+@s WaitGroup int
+
+@* Introduction.
+The OpenResty version of mpresty kept the bodies of remote graphics sources
+in an nginx shared dictionary, declared in \.{mpresty.conf} as
+$$\hbox{\.{lua\_shared\_dict mpresty\_cache 10m;}}$$
+A shared dictionary is a curious beast. It lives in shared memory so that
+several nginx worker processes can see it, and it is bounded in bytes because
+shared memory cannot grow. When I ported mpresty to \GO/ in August 2026
+neither property was worth keeping: there is one process, and its heap grows
+as it likes. What remains is the essence of the thing, a table that forgets
+what nobody has asked for lately.
+
+So this package is a plain {\it least recently used\/} cache of strings,
+bounded by the number of entries rather than their size, and guarded by a
+single mutex so that the goroutines rendering a page may share it. The
+renderer keys it by the URL of a remote source; nothing else in mpresty uses
+it.
+
+@ The whole package fits in one file. Its skeleton lists the parts in the
+order I explain them.
+@c
+// Package cache is the LRU cache mpresty keeps remote graphics sources in.
+package cache
+
+import (
+	"container/list"
+	"sync"
+)
+
+@<The cache type@>
+@<Functions@>
+
+@* The cache.
+The classic way to build an LRU cache is a hash table whose values point into
+a doubly linked list. The list keeps the entries in order of use, most recent
+at the front; the table finds an entry's place in the list in constant time.
+A hit moves the entry to the front, and when the cache overflows the entry at
+the back is the one nobody has missed. The standard package |list| provides
+the list, and a \GO/ map provides the table.
+
+Each list element carries an |entry|, which remembers its own key as well as
+its value. The key looks redundant, since the map already knows it, but
+eviction starts from the list and must then find its way back into the map.
+@<The cache type@>=
+// DefaultCapacity is the number of entries kept before eviction.
+const DefaultCapacity = 4096
+
+type entry struct {
+	key string
+	val string
+}
+
+@ The cache itself is the list, the map, the capacity, and the mutex that
+protects all three. Every method takes the mutex for its whole body; the
+work done under it is a map lookup and a few pointer swaps, far too little
+to be worth anything finer.
+@<The cache type@>=
+// Cache is a safe-for-concurrent-use LRU of strings.
+type Cache struct {
+	mu    sync.Mutex
+	cap   int
+	ll    *list.List
+	items map[string]*list.Element
+}
+
+@ A capacity of zero or less asks for the default. That convention lets the
+command line say \.{-cache 0} to mean ``whatever is sensible,'' and lets the
+renderer call |New(0)| when nobody gave it a cache at all.
+@<Functions@>=
+// New returns a cache holding at most capacity entries. A capacity of zero
+// or less means DefaultCapacity.
+func New(capacity int) *Cache {
+	if capacity <= 0 {
+		capacity = DefaultCapacity
+	}
+	return &Cache{
+		cap:   capacity,
+		ll:    list.New(),
+		items: make(map[string]*list.Element, capacity),
+	}
+}
+
+@ A lookup is also a use, so a hit moves its entry to the front of the list.
+That is why |Get| needs the full mutex and not merely a read lock: in an LRU
+cache even reading writes.
+@<Functions@>=
+// Get returns the value stored under key, if any.
+func (c *Cache) Get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.items[key]
+	if !ok {
+		return "", false
+	}
+	c.ll.MoveToFront(el)
+	return el.Value.(*entry).val, true
+}
+
+@ Storing under a key we already hold replaces the value and counts as a
+use. Otherwise the new entry goes to the front, and the back of the list
+pays for it. The loop could be an |if|, since a single insertion can push
+the cache over its capacity by one entry at most; I wrote it as a loop
+because then the invariant $|ll.Len()|\le|cap|$ is evident from this
+section alone.
+@<Functions@>=
+// Set stores a value, evicting the least recently used entry if full.
+func (c *Cache) Set(key, val string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.MoveToFront(el)
+		el.Value.(*entry).val = val
+		return
+	}
+	c.items[key] = c.ll.PushFront(&entry{key: key, val: val})
+	for c.ll.Len() > c.cap {
+		if el := c.ll.Back(); el != nil {
+			c.ll.Remove(el)
+			delete(c.items, el.Value.(*entry).key)
+		}
+	}
+}
+
+@ The size is reported for the tests' sake.
+@<Functions@>=
+// Len reports how many entries are held.
+func (c *Cache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ll.Len()
+}
+
+@* Tests.
+\.{GTANGLE} writes the tests to \.{cache\_test.go}, beside the package. The
+first test plays out the textbook scenario with a cache of two entries:
+reading \.{a} makes it the most recent, so storing \.{c} must evict \.{b}.
+@(cache_test.go@>=
+package cache
+
+import (
+	"strconv"
+	"sync"
+	"testing"
+)
+
+func TestEvictsLeastRecentlyUsed(t *testing.T) {
+	c := New(2)
+	c.Set("a", "1")
+	c.Set("b", "2")
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("a missing")
+	}
+	c.Set("c", "3")
+	if _, ok := c.Get("b"); ok {
+		t.Error("b should have been evicted")
+	}
+	if v, ok := c.Get("a"); !ok || v != "1" {
+		t.Errorf("a = %q, %v", v, ok)
+	}
+	if n := c.Len(); n != 2 {
+		t.Errorf("Len = %d, want 2", n)
+	}
+}
+
+@ The second test asserts nothing by itself. It hammers the cache from
+thirty-two goroutines at once, and earns its keep under \.{go test -race},
+which would complain if any method touched the list or the map outside the
+mutex.
+@(cache_test.go@>=
+func TestConcurrentUse(t *testing.T) {
+	c := New(64)
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			k := strconv.Itoa(i)
+			c.Set(k, k)
+			c.Get(k)
+		}()
+	}
+	wg.Wait()
+}
+
+@* Index.

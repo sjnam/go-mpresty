@@ -2,3 +2,9 @@
 /mpresty
 /dist
 webapp/html/images
+*.tex
+*.log
+*.toc
+*.idx
+*.scn
+*.pdf

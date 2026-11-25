@@ -1,3 +1,4 @@
+//line server.gw:320
 package server
 
 import (
@@ -14,10 +15,27 @@ import (
 	"github.com/sjnam/go-mpresty/internal/render"
 )
 
-// fake is an engine that copies its source to the SVG, so the server tests
-// need nothing installed.
-func fake() *render.Renderer {
-	return &render.Renderer{
+//line server.gw:339
+func newServer(t *testing.T, files map[string]string) http.Handler {
+	t.Helper()
+	root := t.TempDir()
+	for name, body := range files {
+
+//line server.gw:355
+		full := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+//line server.gw:344
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+//line server.gw:364
+	fake := &render.Renderer{
 		Tag:      "fake",
 		Ext:      "txt",
 		Cmd:      "cp",
@@ -26,25 +44,13 @@ func fake() *render.Renderer {
 			return []string{"cp", fname + ".txt", fname + ".svg"}
 		},
 	}
-}
-
-func newServer(t *testing.T, files map[string]string) http.Handler {
-	t.Helper()
-	root := t.TempDir()
-	for name, body := range files {
-		full := filepath.Join(root, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	proc, err := render.New(render.Options{Root: root, Renderers: []*render.Renderer{fake()}, Logger: log})
+	opts := render.Options{Root: root, Renderers: []*render.Renderer{fake}, Logger: log}
+	proc, err := render.New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+//line server.gw:347
 	s, err := New(root, proc, log)
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +58,7 @@ func newServer(t *testing.T, files map[string]string) http.Handler {
 	return s.Handler()
 }
 
+//line server.gw:381
 func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -59,6 +66,7 @@ func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder
 	return rec
 }
 
+//line server.gw:391
 func TestServesRenderedPage(t *testing.T) {
 	h := newServer(t, map[string]string{
 		"page.html": `<html><body><fake width="70">hi</fake></body></html>`,
@@ -79,7 +87,7 @@ func TestServesRenderedPage(t *testing.T) {
 	}
 }
 
-// Anything that is not HTML goes out as a plain static file, untouched.
+//line server.gw:414
 func TestServesStaticFilesUntouched(t *testing.T) {
 	h := newServer(t, map[string]string{"source/a.txt": "<fake>not html</fake>"})
 	rec := get(t, h, "/source/a.txt")
@@ -91,6 +99,7 @@ func TestServesStaticFilesUntouched(t *testing.T) {
 	}
 }
 
+//line server.gw:427
 func TestMissingPageIs404(t *testing.T) {
 	h := newServer(t, nil)
 	if rec := get(t, h, "/nope.html"); rec.Code != http.StatusNotFound {
@@ -109,6 +118,7 @@ func TestDirectoryServesIndex(t *testing.T) {
 	}
 }
 
+//line server.gw:449
 func TestBenchmarkAppendsElapsed(t *testing.T) {
 	h := newServer(t, map[string]string{"benchmark.html": `<p><fake>x</fake></p>`})
 	rec := get(t, h, "/benchmark.html")
@@ -119,13 +129,12 @@ func TestBenchmarkAppendsElapsed(t *testing.T) {
 
 func TestUpdatenodeUsesPerTagUpdaters(t *testing.T) {
 	h := newServer(t, map[string]string{"updatenode.html": `<p><fake>x</fake></p>`})
-	// The fake tag has no entry in UpdateNodeByTag, so it falls back to the
-	// default rewrite rather than failing.
 	if rec := get(t, h, "/updatenode.html"); !strings.Contains(rec.Body.String(), "<img") {
 		t.Errorf("body = %q", rec.Body.String())
 	}
 }
 
+//line server.gw:467
 func TestPreviewRendersPostedCode(t *testing.T) {
 	h := newServer(t, nil)
 	form := url.Values{"gx": {"fake"}, "cmd": {"cp"}, "code": {"if a<b: draw x;"}}
@@ -133,7 +142,6 @@ func TestPreviewRendersPostedCode(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/preview.gxn", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	h.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
 	}
@@ -142,6 +150,7 @@ func TestPreviewRendersPostedCode(t *testing.T) {
 	}
 }
 
+//line server.gw:484
 func TestPreviewRejectsUnknownTag(t *testing.T) {
 	h := newServer(t, nil)
 	rec := httptest.NewRecorder()

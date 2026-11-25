@@ -1,0 +1,1105 @@
+\def\title{RENDER}
+
+@s Context int
+@s Duration int
+@s Logger int
+@s Client int
+@s Group int
+@s Node int
+@s Cache int
+@s Buffer int
+@s Response int
+@s T int
+@s Builder int
+
+@* Introduction.
+Some years ago I wrote mpresty, a small web application on OpenResty, which
+is nginx with LuaJIT inside. An author writes MetaPost or Graphviz source
+straight into an HTML page,
+$$\vbox{\halign{\.{#}\hfil\cr
+<metapost width="200">\cr
+beginfig(1)\cr
+\ \ draw fullcircle scaled 2cm;\cr
+endfig;\cr
+</metapost>\cr}}$$
+and on the way out mpresty runs the engine and replaces the element by an
+\.{<img>} pointing at the resulting SVG. The same works for an ordinary
+\.{<img src="tree.mp">}, where the extension of the source file chooses the
+engine. The original lives at \.{https://github.com/sjnam/mpresty}.
+
+In August 2026 I ported it to \GO/, and this package is the heart of the port:
+it finds the graphics elements in a parsed document, renders them, in parallel,
+and rewrites them in place. The Lua code it replaces was spread over
+\.{lib/mpresty/*.lua}, one file per engine plus a \.{base.lua} they shared.
+
+@ One thing in the Lua code could not be carried over as it was, and it shaped
+everything here. \.{base.lua} stored the per-request state, the command to run,
+the document, whether to use the cache, on the module itself, while several
+light threads (\.{ngx.thread.spawn}) walked the document at once. That was safe
+only because those threads are coroutines: cooperative, and all on one
+operating-system thread, so nobody could change the module's fields between
+two statements of somebody else. Goroutines enjoy no such protection.
+
+So in this package a |Renderer| is immutable configuration, shared freely by
+every request, and everything that varies from one node to the next travels as
+a local variable of the goroutine that renders it. The |Processor| holds only
+configuration and a few concurrency-safe helpers, so a single one serves the
+whole server.
+
+@ The skeleton of the package.
+@c
+// Package render turns graphics source embedded in an HTML document
+// into SVG images.
+package render
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/sjnam/go-mpresty/internal/cache"
+	"github.com/sjnam/go-mpresty/internal/htmldoc"
+)
+
+@<Renderers@>
+@<Updaters@>
+@<The processor@>
+@<Functions@>
+
+@* Renderers.
+A |Renderer| describes one graphics engine: the element it claims, the
+extension of its source files, the command that runs it, and the text to wrap
+around the author's source. The Lua original built the command line as a
+string and handed it to a shell, with the \.{cmd} attribute of the element
+pasted in. Here |Command| returns an argument vector that runs without a shell,
+so whatever an author writes in \.{cmd} reaches the engine as one harmless
+word; and the list |Commands| bounds even that.
+@<Renderers@>=
+// Renderer describes one graphics engine. Every field is read-only once
+// the Renderer is registered, so a single value is shared safely.
+type Renderer struct {
+	Tag       string   // custom element name, e.g. "metapost"
+	Ext       string   // source file extension, e.g. "mp"
+	Cmd       string   // default command
+	Commands  []string // commands a cmd attribute may select
+	Preamble  string
+	Postamble string
+
+	// Command returns the argv to run inside a job directory that already
+	// holds fname.Ext. It must leave fname.svg there.
+	Command func(cmd, fname string) []string
+}
+
+@ MetaPost needs to be told to write SVG, and under which name. The output
+template \.{\%j.svg} names the file after the job, which is the source file's
+name without extension. In SVG mode \.{prologues:=3} converts the glyphs of
+the labels to path definitions at the top of the file, so the picture looks
+the same whatever fonts the browser has (see section~8.1 of the MetaPost
+manual). The Lua version appended \.{end} to every source, and so do I, but on
+a line of its own so that a source ending in a comment still terminates.
+@<Renderers@>=
+// MetaPost renders metapost elements and .mp sources.
+var MetaPost = &Renderer{
+	Tag:      "metapost",
+	Ext:      "mp",
+	Cmd:      "mpost",
+	Commands: []string{"mpost", "mpost-lua"},
+	Preamble: "prologues:=3;\noutputtemplate:=\"%j.svg\";\noutputformat:=\"svg\";\n",
+	Postamble: "\nend\n",
+	Command: func(cmd, fname string) []string {
+		return []string{cmd, "-interaction=nonstopmode", fname + ".mp"}
+	},
+}
+
+@ Graphviz is simpler: every layout engine in the family takes the same
+options, so an author may pick any of them with \.{cmd}.
+@<Renderers@>=
+// Graphviz renders graphviz elements and .gv sources.
+var Graphviz = &Renderer{
+	Tag: "graphviz",
+	Ext: "gv",
+	Cmd: "dot",
+	Commands: []string{
+		"dot", "neato", "fdp", "sfdp", "twopi", "circo", "osage", "patchwork",
+	},
+	Command: func(cmd, fname string) []string {
+		return []string{cmd, "-Tsvg", fname + ".gv", "-o", fname + ".svg"}
+	},
+}
+
+@* Updaters.
+Once a node's SVG exists, something must rewrite the node. In mpresty that
+something was a Lua function called |fn_update_node|, and a page could supply
+its own: \.{exemples.html} showed the source above each picture, for instance.
+The convention was that |fn_update_node| might be a single function or a table
+of functions keyed by tag name. In \GO/ the function is an |UpdateNodeFunc|,
+and |Updaters| holds both forms at once. The arguments are the document, the
+element that carried the source, the URI of the SVG, and the graphics source
+itself.
+@<Updaters@>=
+// UpdateNodeFunc rewrites one graphics node once its image is ready.
+type UpdateNodeFunc func(doc, node *htmldoc.Node, uri, content string)
+
+// Updaters selects an UpdateNodeFunc per tag: an entry of ByTag if there
+// is one, else Default, else DefaultUpdateNode.
+type Updaters struct {
+	Default UpdateNodeFunc
+	ByTag   map[string]UpdateNodeFunc
+}
+
+@ The default rewrite is the one in \.{base.lua}: the node becomes an
+\.{<img>}, keeps whatever attributes the author gave it, and gets a width of
+300 pixels unless the author gave one.
+@<Functions@>=
+// DefaultUpdateNode replaces the node with an img pointing at the SVG.
+func DefaultUpdateNode(doc, node *htmldoc.Node, uri, content string) {
+	htmldoc.Rename(node, "img")
+	htmldoc.SetAttr(node, "src", uri)
+	if !htmldoc.HasAttr(node, "width") {
+		htmldoc.SetAttr(node, "width", "300")
+	}
+}
+
+@* The processor.
+A |Processor| is configured once, from |Options|, and then renders any number
+of documents, concurrently. Every option has a sensible default, so the zero
+|Options| with only |Root| filled in is a working configuration.
+@<The processor@>=
+// Options configures a Processor.
+type Options struct {
+	Root      string        // document root; sources are read under it
+	WorkDir   string        // rendered SVGs, relative to Root
+	Timeout   time.Duration // wall clock budget for one engine run
+	MaxJobs   int           // concurrent engine runs
+	Cache     *cache.Cache  // caches remote sources
+	Client    *http.Client  // fetches remote sources
+	Renderers []*Renderer   // the engines
+	Logger    *slog.Logger
+}
+
+@ The processor keeps its renderers twice, by tag for the custom elements and
+by extension for the \.{<img>} form. The |singleflight.Group| makes identical
+concurrent renders collapse into one engine run; more of it later.
+@<The processor@>=
+// Processor renders every graphics node in a document. It is safe for
+// concurrent use and holds no per-request state.
+type Processor struct {
+	root    string
+	workDir string
+	tmpDir  string
+	timeout time.Duration
+	maxJobs int
+	cache   *cache.Cache
+	client  *http.Client
+	log     *slog.Logger
+
+	byTag map[string]*Renderer
+	byExt map[string]*Renderer
+	group singleflight.Group
+}
+
+@ The constructor fills in the defaults, builds the processor, and makes sure
+the directory where the engines will work exists.
+@<Functions@>=
+// New prepares a Processor, creating the work directory if needed.
+func New(opts Options) (*Processor, error) {
+	root, err := filepath.Abs(opts.Root)
+	if err != nil {
+		return nil, err
+	}
+	@<Fill in the defaults of |opts|@>
+	@<Create the processor |p|@>
+	if err := os.MkdirAll(p.tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	@<Register the renderers of |opts| with |p|@>
+	return p, nil
+}
+
+@ The images go to \.{images/}, as they did in the Lua version. An engine run
+gets thirty seconds, which is generous for any figure a person draws by hand;
+there may be as many runs at once as there are processors to run them; and a
+remote source gets fifteen seconds to arrive.
+@<Fill in the defaults of |opts|@>=
+if opts.WorkDir == "" {
+	opts.WorkDir = "images"
+}
+if opts.Timeout <= 0 {
+	opts.Timeout = 30 * time.Second
+}
+if opts.MaxJobs <= 0 {
+	opts.MaxJobs = runtime.GOMAXPROCS(0)
+}
+if opts.Cache == nil {
+	opts.Cache = cache.New(0)
+}
+if opts.Client == nil {
+	opts.Client = &http.Client{Timeout: 15 * time.Second}
+}
+if opts.Renderers == nil {
+	opts.Renderers = []*Renderer{MetaPost, Graphviz}
+}
+if opts.Logger == nil {
+	opts.Logger = slog.Default()
+}
+
+@ Engine jobs run in scratch directories under \.{images/.tmp}. Putting them
+under the work directory, rather than in the system's temporary directory,
+guarantees that the finished SVG lies on the same file system as its final
+home, so moving it there is a rename and never a copy.
+@<Create the processor |p|@>=
+p := &Processor{
+	root:    root,
+	workDir: opts.WorkDir,
+	tmpDir:  filepath.Join(root, filepath.FromSlash(opts.WorkDir), ".tmp"),
+	timeout: opts.Timeout,
+	maxJobs: opts.MaxJobs,
+	cache:   opts.Cache,
+	client:  opts.Client,
+	log:     opts.Logger,
+	byTag:   make(map[string]*Renderer),
+	byExt:   make(map[string]*Renderer),
+}
+
+@ An engine that is not installed still renders---as a red error on the page.
+It is kinder to say so once at startup than to let the first author find out.
+@<Register the renderers of |opts| with |p|@>=
+for _, r := range opts.Renderers {
+	p.byTag[r.Tag] = r
+	p.byExt[r.Ext] = r
+	if _, err := exec.LookPath(r.Cmd); err != nil {
+		p.log.Warn("engine not installed; its elements will render as errors",
+			"tag", r.Tag, "cmd", r.Cmd)
+	}
+}
+
+@ The parser in package |htmldoc| must be told which elements hold graphics
+source, so that it can shield their bodies. Those are exactly the tags of the
+registered renderers.
+@<Functions@>=
+// RawTags lists the element names whose bodies must reach the engine
+// verbatim. Pass them to htmldoc.Parse.
+func (p *Processor) RawTags() []string {
+	tags := make([]string, 0, len(p.byTag))
+	for tag := range p.byTag {
+		tags = append(tags, tag)
+	}
+	return tags
+}
+
+@ What varies from one page to the next is gathered in a |Request|. The flag
+|NoCache| is the old \.{?debug} query, which made the Lua version render
+everything afresh.
+@<The processor@>=
+// Request carries everything that varies from one page render to the next.
+type Request struct {
+	// BaseURI is the URI of the page being rendered; relative src
+	// attributes resolve against its directory.
+	BaseURI string
+	// NoCache renders every node afresh.
+	NoCache bool
+	// Updaters chooses how each rendered node is rewritten.
+	Updaters Updaters
+}
+
+@* Processing a document.
+Here is the method the server calls, once per page. It finds every node that a
+renderer claims, starts a goroutine for each, and waits for all of them.
+
+A node that fails to render is replaced by its error message rather than
+failing the whole page; a page with one broken figure out of thirty is still
+worth reading. So the goroutines report only one kind of error to the group:
+cancellation, when the client has gone away and there is no page to finish.
+The |errgroup| then cancels the rest.
+@<Functions@>=
+// Process renders every graphics node in doc, in parallel, and rewrites
+// it in place. A node that fails to render shows its error instead; only
+// cancellation is reported as an error.
+func (p *Processor) Process(ctx context.Context, doc *htmldoc.Node, req Request) error {
+	@<Collect the |jobs| in |doc|@>
+	if len(jobs) == 0 {
+		return nil
+	}
+	@<Let |base| be the directory of the page@>
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(p.maxJobs)
+	for _, j := range jobs {
+		g.Go(func() error {
+			@<Render the node of |j| and rewrite it@>
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+@ A |job| pairs a node with the renderer that claimed it.
+@<The processor@>=
+type job struct {
+	r    *Renderer
+	node *htmldoc.Node
+}
+
+@ A renderer claims its custom elements by tag name, and every \.{<img>} whose
+\.{src} ends in its extension. The list is collected in full before any job
+starts, so the goroutines can rewrite their nodes without upsetting the
+search.
+@<Collect the |jobs| in |doc|@>=
+var jobs []job
+for tag, r := range p.byTag {
+	for _, n := range htmldoc.Elements(doc, tag) {
+		jobs = append(jobs, job{r: r, node: n})
+	}
+}
+for _, n := range htmldoc.Elements(doc, "img") {
+	if src, ok := htmldoc.Attr(n, "src"); ok {
+		if r, ok := p.byExt[strings.TrimPrefix(path.Ext(src), ".")]; ok {
+			jobs = append(jobs, job{r: r, node: n})
+		}
+	}
+}
+
+@ A relative \.{src} resolves against the directory of the page, as a browser
+would resolve it. I keep that directory with its trailing slash, so that
+resolving is plain concatenation.
+@<Let |base| be the directory of the page@>=
+base := path.Dir(req.BaseURI)
+if base != "/" {
+	base += "/"
+}
+
+@* Rendering one node.
+Each goroutine walks its node through four steps: decide whether the cache may
+be used, get the graphics source, choose the command, and make sure the SVG
+exists. Any step may fail. Rather than return from the middle, each step sets
+|err| and the later ones stand aside, so that the outcome is decided in one
+place at the end: the error shown on the page, or the image.
+
+The three strings are declared up front because the steps share them: the
+source in |content|, the command in |cmd|, and the URI of the image in |uri|.
+@<Render the node of |j| and rewrite it@>=
+r, node := j.r, j.node
+var content, cmd, uri string
+var err error
+@<Decide whether |node| may use the cache@>
+@<Get the graphics source of |node| into |content|@>
+if err == nil {
+	@<Choose the command |cmd|, if |r| allows it@>
+}
+if err == nil {
+	@<Make sure the SVG for |content| exists, and set |uri|@>
+}
+if err != nil {
+	@<Show |err| in red where the image would have been@>
+} else {
+	@<Rewrite |node| with the updater for its tag@>
+}
+
+@ Two things switch the cache off: the request as a whole, through
+\.{?debug}, and the element itself, through \.{cache="no"}. Like every
+attribute the pipeline consumes, \.{cache} is removed from the node, so it
+does not leak into the page.
+@<Decide whether |node| may use the cache@>=
+useCache := !req.NoCache
+if htmldoc.AttrOr(node, "cache", "") == "no" {
+	useCache = false
+}
+htmldoc.RemoveAttr(node, "cache")
+
+@ The source is the body of the element, unless the element has a \.{src}
+attribute, in which case it is the file that attribute names. That file may
+be local, under the document root, or remote.
+@<Get the graphics source of |node| into |content|@>=
+if src, ok := htmldoc.Attr(node, "src"); !ok {
+	content = htmldoc.TextContent(node)
+} else {
+	htmldoc.RemoveAttr(node, "src")
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		@<Fetch the remote source |src| into |content|@>
+	} else {
+		@<Read the local source |src| into |content|@>
+	}
+}
+
+@ The Lua version fetched even a local source over HTTP, through nginx, with
+|ngx.location.capture|. A subrequest is confined to what nginx serves, so it
+could never wander out of the document root. Reading the file system directly
+is much cheaper, but the confinement must now be done by hand, and that is the
+business of |resolve|.
+@<Read the local source |src| into |content|@>=
+var name string
+if name, err = p.resolve(src, base); err == nil {
+	var b []byte
+	if b, err = os.ReadFile(name); err == nil {
+		content = string(b)
+	} else {
+		err = fmt.Errorf("read %s: %w", src, err)
+	}
+}
+
+@ |path.Clean| removes every \.{..} that it can, and a rooted path has nothing
+above its root, so cleaning \.{/../secret} yields \.{/secret}. A URI that
+starts with a slash therefore cannot escape. A relative one is rooted by
+|base|, which comes from the page's own URI and starts with a slash as well.
+Still, I check the result instead of trusting that argument: a test calls
+|resolve| with an empty |base| precisely to see the check refuse.
+@<Functions@>=
+// resolve maps a document-relative or absolute URI to a path inside the
+// document root, refusing anything that would escape it.
+func (p *Processor) resolve(uri, base string) (string, error) {
+	if !strings.HasPrefix(uri, "/") {
+		uri = base + uri
+	}
+	name := filepath.Join(p.root, filepath.FromSlash(path.Clean(uri)))
+	if name != p.root && !strings.HasPrefix(name, p.root+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path %q escapes the document root", uri)
+	}
+	return name, nil
+}
+
+@ A remote source is cached under its URL, in the LRU of package |cache|, as
+the Lua version cached it in its shared dictionary. Without that cache a page
+showing a figure from another site would fetch it on every view, even though
+the SVG itself is long since on disk.
+@<Fetch the remote source |src| into |content|@>=
+key := "src:" + src
+hit := false
+if useCache {
+	content, hit = p.cache.Get(key)
+}
+if !hit {
+	@<Download |src| into |content|@>
+	if err == nil {
+		p.cache.Set(key, content)
+	}
+}
+
+@ The download uses the goroutine's context, so a client who goes away stops
+it. Anything but \.{200 OK} is an error, and a source larger than four
+megabytes is cut short; nobody writes a MetaPost figure that long, and the
+limit keeps a hostile URL from filling memory.
+@<Download |src| into |content|@>=
+var hreq *http.Request
+var res *http.Response
+hreq, err = http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+if err == nil {
+	res, err = p.client.Do(hreq)
+}
+if err == nil {
+	if res.StatusCode != http.StatusOK {
+		err = fmt.Errorf("fetch %s: %s", src, res.Status)
+	} else if b, rerr := io.ReadAll(io.LimitReader(res.Body, 4<<20)); rerr != nil {
+		err = fmt.Errorf("fetch %s: %w", src, rerr)
+	} else {
+		content = string(b)
+	}
+	res.Body.Close()
+}
+
+@ The command comes from the \.{cmd} attribute, if any, and must be the
+renderer's default or on its list.
+@<Choose the command |cmd|, if |r| allows it@>=
+cmd = htmldoc.AttrOr(node, "cmd", r.Cmd)
+htmldoc.RemoveAttr(node, "cmd")
+if cmd != r.Cmd && !slices.Contains(r.Commands, cmd) {
+	err = fmt.Errorf("%s: command %q is not allowed", r.Tag, cmd)
+}
+
+@* Running an engine.
+The SVG is named after the command and a CRC-32 of the source, exactly as the
+Lua version named it, so an \.{images/} directory filled by the original stays
+valid after the port. The CRC is taken of the author's source alone, before
+the preamble and postamble are wrapped around it.
+
+The rendered file is its own cache. If it exists, we are done. The Lua
+version remembered in its shared dictionary which sources it had rendered;
+asking the file system instead cannot go stale when somebody empties
+\.{images/}, and it survives a restart.
+
+Two requests for the same source at the same moment, which is what happens
+when a popular page is fresh, would both find no file and both run the
+engine. The |singleflight.Group| collapses them: the second caller waits for
+the first one's run and shares its outcome. Inside, the cache is checked a
+second time, because the file may have appeared while this caller was on its
+way to the group.
+@<Make sure the SVG for |content| exists, and set |uri|@>=
+fname := cmd + strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(content))), 10)
+uri = path.Join("/", p.workDir, fname+".svg")
+if !useCache || !p.rendered(fname) {
+	_, err, _ = p.group.Do(r.Tag+fname, func() (any, error) {
+		if useCache && p.rendered(fname) {
+			return nil, nil
+		}
+		@<Run |r| on |content| in a scratch directory and keep the SVG@>
+	})
+}
+
+@ Two little functions name the file and ask whether it exists.
+@<Functions@>=
+// rendered reports whether the SVG for this name is already on disk.
+func (p *Processor) rendered(fname string) bool {
+	_, err := os.Stat(p.svgPath(fname))
+	return err == nil
+}
+
+func (p *Processor) svgPath(fname string) string {
+	return filepath.Join(p.root, filepath.FromSlash(p.workDir), fname+".svg")
+}
+
+@ Isolation matters more here than it did in Lua. The original ran every
+engine in \.{images/} itself and cleaned up after it with
+\.{rm F.log F.mp*}. But MetaPost's helper \.{makempx}, which typesets the
+\.{btex} labels, writes temporary files with fixed names, so two genuinely
+parallel runs in one directory would trample each other. Each run therefore
+gets a scratch directory of its own, removed when the run is over, and only
+the finished SVG leaves it. The run also gets its own deadline.
+
+This code runs inside the closure given to |group.Do|, so its |return|
+statements return from that closure, with the error the group hands on.
+@<Run |r| on |content| in a scratch directory and keep the SVG@>=
+ctx, cancel := context.WithTimeout(ctx, p.timeout)
+defer cancel()
+dir, err := os.MkdirTemp(p.tmpDir, "job-")
+if err != nil {
+	return nil, err
+}
+defer os.RemoveAll(dir)
+text := r.Preamble + content + r.Postamble
+if err := os.WriteFile(filepath.Join(dir, fname+"."+r.Ext), []byte(text), 0o644); err != nil {
+	return nil, err
+}
+@<Run the engine in |dir|@>
+@<Move the SVG out of |dir|@>
+
+@ An engine must never wait on a terminal, so its standard input is empty; and
+its output and error streams go to one buffer, since they are interleaved in
+the log a human will want to read.
+
+The environment matters to \TeX-based engines. \.{TEXMFOUTPUT} and
+\.{openout\_any=p} confine what they may write. The search paths deserve a
+word of their own. A source may \.{input} a sibling: \.{benchmark.html}'s
+\.{bird.mp} inputs \.{courbes.mp}. The Lua version got that for free by
+running in the directory where the sources were; an isolated job needs a
+search path that includes the document root. \.{TEXINPUTS} is there for
+MetaPost's sake as well, because \.{btex} labels are typeset by \.{makempx},
+which runs plain \TeX\ and searches along it.
+@<Run the engine in |dir|@>=
+argv := r.Command(cmd, fname)
+c := exec.CommandContext(ctx, argv[0], argv[1:]...)
+c.Dir = dir
+c.Stdin = nil
+c.Env = append(os.Environ(),
+	"TEXMFOUTPUT="+dir,
+	"openout_any=p",
+	"MPINPUTS="+p.inputs(dir),
+	"TEXINPUTS="+p.inputs(dir),
+)
+var out bytes.Buffer
+c.Stdout, c.Stderr = &out, &out
+if err := c.Run(); err != nil {
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("%s: %w", argv[0], ctx.Err())
+	}
+	diag := out.String()
+	@<Trim |diag| to the part worth showing@>
+	return nil, fmt.Errorf("%s: %w\n%s", argv[0], err, diag)
+}
+
+@ The search path in kpathsea's notation: the job's own directory first, then
+the document root and everything below it (a doubled separator asks kpathsea
+to search recursively), then, by an empty element, whatever the installation
+provides.
+@<Functions@>=
+// inputs is the kpathsea search path for a job.
+func (p *Processor) inputs(dir string) string {
+	sep := string(filepath.ListSeparator)
+	sub := p.root + string(filepath.Separator) + string(filepath.Separator)
+	return strings.Join([]string{dir, sub, ""}, sep)
+}
+
+@ The diagnostic will be shown on the page, so it should be short. MetaPost and
+\TeX\ report the actual error at the end of a long log, so I keep the last
+thirty lines. Some engines say nothing on their output streams and write
+everything to a log file, which is then the better source.
+@<Trim |diag| to the part worth showing@>=
+if strings.TrimSpace(diag) == "" {
+	if b, err := os.ReadFile(filepath.Join(dir, fname+".log")); err == nil {
+		diag = string(b)
+	}
+}
+lines := strings.Split(strings.TrimRight(diag, "\n"), "\n")
+if len(lines) > 30 {
+	lines = append([]string{"..."}, lines[len(lines)-30:]...)
+}
+diag = strings.Join(lines, "\n")
+
+@ An engine that exits happily without producing the SVG is an error too.
+Otherwise the file moves to its final place, atomically, so no reader ever sees half an SVG.
+@<Move the SVG out of |dir|@>=
+svg := filepath.Join(dir, fname+".svg")
+if _, err := os.Stat(svg); err != nil {
+	return nil, fmt.Errorf("%s produced no %s.svg", cmd, fname)
+}
+return nil, os.Rename(svg, p.svgPath(fname))
+
+@* Showing the result.
+If |err| is set, the node becomes a red \.{<pre>} with the message in it, so
+the author sees on the page itself what went wrong and where. Cancellation is
+the exception: then nobody is reading the page, and the goroutine returns the
+error so that the group stops the others.
+@<Show |err| in red where the image would have been@>=
+if ctx.Err() != nil {
+	return ctx.Err()
+}
+p.log.Error("render failed", "tag", r.Tag, "uri", req.BaseURI, "err", err)
+htmldoc.Rename(node, "pre")
+htmldoc.SetTextContent(node, err.Error())
+htmldoc.SetAttr(node, "style", "color:red")
+htmldoc.RemoveAttr(node, "width")
+
+@ Otherwise the source text goes, and the updater chosen for this tag rewrites
+the node: the one registered for the tag, else the request's default, else
+|DefaultUpdateNode|.
+@<Rewrite |node| with the updater for its tag@>=
+htmldoc.RemoveChildren(node)
+update := DefaultUpdateNode
+if fn := req.Updaters.ByTag[r.Tag]; fn != nil {
+	update = fn
+} else if req.Updaters.Default != nil {
+	update = req.Updaters.Default
+}
+update(doc, node, uri, content)
+
+@* Tests.
+\.{GTANGLE} writes the tests to \.{render\_test.go}. Most of them use a fake
+engine that needs no \TeX\ installation: its ``command'' is \.{cp}, which
+copies the source file to the SVG the pipeline expects. So the tests exercise
+the plumbing, not MetaPost, and the SVG they find is the very text the engine
+was given, preamble and postamble included.
+@(render_test.go@>=
+package render
+
+import (
+	"context"
+	"hash/crc32"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/sjnam/go-mpresty/internal/htmldoc"
+)
+
+@<Test helpers@>
+
+@ Every test makes its processor in a temporary directory of its own, with the
+fake engine as its only renderer and a logger that says nothing.
+@<Test helpers@>=
+func newProcessor(t *testing.T, root string) *Processor {
+	t.Helper()
+	fake := &Renderer{
+		Tag:       "fake",
+		Ext:       "txt",
+		Cmd:       "cp",
+		Commands:  []string{"cp"},
+		Preamble:  "P:",
+		Postamble: ":Q",
+		Command: func(cmd, fname string) []string {
+			return []string{"cp", fname + ".txt", fname + ".svg"}
+		},
+	}
+	p, err := New(Options{Root: root, Renderers: []*Renderer{fake}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+@ Then most tests parse a page, process it, and look at the tree.
+@<Test helpers@>=
+func process(t *testing.T, p *Processor, html string, req Request) *htmldoc.Node {
+	t.Helper()
+	doc, err := htmldoc.Parse(strings.NewReader(html), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.BaseURI == "" {
+		req.BaseURI = "/page.html"
+	}
+	if err := p.Process(context.Background(), doc, req); err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+@ The expected file names are computed the way the pipeline computes them:
+from the CRC-32 of the source itself.
+@<Test helpers@>=
+func crcOf(s string) string {
+	return strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(s))), 10)
+}
+
+@ Files go in and out of the temporary root through two helpers that fail the
+test rather than return an error.
+@<Test helpers@>=
+func writeFile(t *testing.T, name, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readFile(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+@ The first test follows one inline source all the way. The image must be
+named by the CRC of \.{hello}, keep the author's width, and contain what the
+engine saw: the source wrapped in preamble and postamble.
+@(render_test.go@>=
+func TestRendersInlineSource(t *testing.T) {
+	root := t.TempDir()
+	p := newProcessor(t, root)
+	doc := process(t, p, `<fake width="120">hello</fake>`, Request{})
+	img := htmldoc.Elements(doc, "img")
+	if len(img) != 1 {
+		t.Fatalf("got %d img elements, want 1", len(img))
+	}
+	src, _ := htmldoc.Attr(img[0], "src")
+	if want := "/images/cp" + crcOf("hello") + ".svg"; src != want {
+		t.Errorf("src = %q, want %q", src, want)
+	}
+	if w, _ := htmldoc.Attr(img[0], "width"); w != "120" {
+		t.Errorf("width = %q, want the author's 120", w)
+	}
+	got := readFile(t, filepath.Join(root, "images", "cp"+crcOf("hello")+".svg"))
+	if got != "P:hello:Q" {
+		t.Errorf("engine input = %q, want %q", got, "P:hello:Q")
+	}
+}
+
+@ Without a width from the author, the default updater supplies 300.
+@(render_test.go@>=
+func TestDefaultWidthWhenAuthorGivesNone(t *testing.T) {
+	p := newProcessor(t, t.TempDir())
+	doc := process(t, p, `<fake>x</fake>`, Request{})
+	if w, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "width"); w != "300" {
+		t.Errorf("width = %q, want 300", w)
+	}
+}
+
+@ The \.{<img src="....txt">} form must render just like the custom element,
+and a relative \.{src} resolves against the directory of the page.
+@(render_test.go@>=
+func TestRendersImgBySourceExtension(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "source", "a.txt"), "from-file")
+	p := newProcessor(t, root)
+	doc := process(t, p, `<img src="/source/a.txt" width="90">`, Request{})
+	src, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "src")
+	if want := "/images/cp" + crcOf("from-file") + ".svg"; src != want {
+		t.Errorf("src = %q, want %q", src, want)
+	}
+}
+
+func TestRelativeSourceResolvesAgainstPage(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "docs", "b.txt"), "sibling")
+	p := newProcessor(t, root)
+	doc := process(t, p, `<img src="b.txt">`, Request{BaseURI: "/docs/index.html"})
+	src, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "src")
+	if want := "/images/cp" + crcOf("sibling") + ".svg"; src != want {
+		t.Errorf("src = %q, want %q", src, want)
+	}
+}
+
+@ A traversing \.{src} must never reach outside the document root. I plant a
+file next to the root and ask for it; cleaning the URI as a rooted path
+neutralizes the \.{..}, so the file simply is not there, and the node turns
+into an error that must not contain the planted text.
+@(render_test.go@>=
+func TestTraversingSourceStaysInsideRoot(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(filepath.Dir(root), "secret.txt"), "outside")
+	p := newProcessor(t, root)
+	doc := process(t, p, `<img src="/../secret.txt">`, Request{})
+	pre := htmldoc.Elements(doc, "pre")
+	if len(pre) != 1 {
+		t.Fatalf("got %d error nodes, want 1", len(pre))
+	}
+	if got := htmldoc.TextContent(pre[0]); strings.Contains(got, "outside") {
+		t.Errorf("the file outside the root was read: %q", got)
+	}
+	if n := len(htmldoc.Elements(doc, "img")); n != 0 {
+		t.Errorf("got %d rendered images, want none", n)
+	}
+}
+
+@ That test never reaches the check inside |resolve|, so this one calls it
+directly, with a path that no cleaning can save.
+@(render_test.go@>=
+func TestResolveRefusesEscape(t *testing.T) {
+	p := newProcessor(t, t.TempDir())
+	if _, err := p.resolve("../../etc/passwd", ""); err == nil {
+		t.Error("resolve accepted a path that escapes the root")
+	}
+	if _, err := p.resolve("a.txt", "/docs/"); err != nil {
+		t.Errorf("resolve rejected an ordinary path: %v", err)
+	}
+}
+
+@ A \.{cmd} attribute picks the engine binary, so it must be bounded by the
+renderer's list. The Lua version pasted it into a shell command.
+@(render_test.go@>=
+func TestRejectsDisallowedCommand(t *testing.T) {
+	p := newProcessor(t, t.TempDir())
+	doc := process(t, p, `<fake cmd="rm">x</fake>`, Request{})
+	pre := htmldoc.Elements(doc, "pre")
+	if len(pre) != 1 {
+		t.Fatalf("got %d error nodes, want 1", len(pre))
+	}
+	if got := htmldoc.TextContent(pre[0]); !strings.Contains(got, "not allowed") {
+		t.Errorf("error text = %q", got)
+	}
+}
+
+@ An SVG already on disk is reused untouched. I plant a sentinel where the
+image belongs and check that it survives an ordinary request, and that both
+\.{?debug} and \.{cache="no"} replace it.
+@(render_test.go@>=
+func TestCacheReusesRenderedFile(t *testing.T) {
+	root := t.TempDir()
+	p := newProcessor(t, root)
+	svg := filepath.Join(root, "images", "cp"+crcOf("keep")+".svg")
+	writeFile(t, svg, "SENTINEL")
+	process(t, p, `<fake>keep</fake>`, Request{})
+	if got := readFile(t, svg); got != "SENTINEL" {
+		t.Errorf("cached file was rebuilt: %q", got)
+	}
+	@<Check that |NoCache| and \.{cache="no"} rebuild |svg|@>
+}
+
+@ @<Check that |NoCache| and...@>=
+process(t, p, `<fake>keep</fake>`, Request{NoCache: true})
+if got := readFile(t, svg); got != "P:keep:Q" {
+	t.Errorf("NoCache did not rebuild: %q", got)
+}
+writeFile(t, svg, "SENTINEL")
+process(t, p, `<fake cache="no">keep</fake>`, Request{})
+if got := readFile(t, svg); got != "P:keep:Q" {
+	t.Errorf(`cache="no" did not rebuild: %q`, got)
+}
+
+@ The attributes the pipeline consumes must not survive into the output.
+@(render_test.go@>=
+func TestConsumedAttributesAreRemoved(t *testing.T) {
+	p := newProcessor(t, t.TempDir())
+	doc := process(t, p, `<fake cmd="cp" cache="no" width="50">x</fake>`, Request{})
+	img := htmldoc.Elements(doc, "img")[0]
+	for _, k := range []string{"cmd", "cache"} {
+		if htmldoc.HasAttr(img, k) {
+			t.Errorf("attribute %q leaked into the output", k)
+		}
+	}
+}
+
+@ An updater registered for a tag takes over from the default. This one turns
+the node into a \.{<figure>} holding the source and the URI.
+@(render_test.go@>=
+func TestUpdatersSelectPerTag(t *testing.T) {
+	p := newProcessor(t, t.TempDir())
+	req := Request{Updaters: Updaters{ByTag: map[string]UpdateNodeFunc{
+		"fake": func(doc, node *htmldoc.Node, uri, content string) {
+			htmldoc.Rename(node, "figure")
+			htmldoc.SetTextContent(node, content+"|"+uri)
+		},
+	}}}
+	doc := process(t, p, `<fake>src</fake>`, req)
+	fig := htmldoc.Elements(doc, "figure")
+	if len(fig) != 1 {
+		t.Fatalf("got %d figure elements, want 1", len(fig))
+	}
+	if got := htmldoc.TextContent(fig[0]); !strings.HasPrefix(got, "src|/images/") {
+		t.Errorf("figure text = %q", got)
+	}
+}
+
+@ Many nodes at once is the whole point of the port. These two tests are
+meant to be run under \.{go test -race}: forty different nodes in one page,
+then eight pages racing on the same source, which must not fight over one
+file.
+@(render_test.go@>=
+func TestConcurrentNodes(t *testing.T) {
+	p := newProcessor(t, t.TempDir())
+	var b strings.Builder
+	for i := range 40 {
+		b.WriteString("<fake>n" + strconv.Itoa(i) + "</fake>")
+	}
+	doc := process(t, p, b.String(), Request{})
+	if n := len(htmldoc.Elements(doc, "img")); n != 40 {
+		t.Fatalf("got %d img elements, want 40", n)
+	}
+	if n := len(htmldoc.Elements(doc, "pre")); n != 0 {
+		t.Errorf("got %d error nodes, want none", n)
+	}
+}
+
+@ @(render_test.go@>=
+func TestConcurrentIdenticalSources(t *testing.T) {
+	root := t.TempDir()
+	p := newProcessor(t, root)
+	done := make(chan struct{})
+	for range 8 {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			doc, _ := htmldoc.Parse(strings.NewReader(`<fake>same</fake>`), p.RawTags()...)
+			p.Process(context.Background(), doc, Request{BaseURI: "/p.html"})
+		}()
+	}
+	for range 8 {
+		<-done
+	}
+	svg := filepath.Join(root, "images", "cp"+crcOf("same")+".svg")
+	if got := readFile(t, svg); got != "P:same:Q" {
+		t.Errorf("svg = %q", got)
+	}
+}
+
+@* Tests with real engines.
+The engines are real programs, so the remaining tests run only where they are
+installed, and skip themselves elsewhere.
+@<Test helpers@>=
+func requireCommand(t *testing.T, name string) {
+	t.Helper()
+	if _, err := exec.LookPath(name); err != nil {
+		t.Skipf("%s is not installed", name)
+	}
+}
+
+@ MetaPost, end to end, with the characters the gumbo-based original lost: a
+\.{<} in a comparison and an \.{\&} joining two strings.
+@(render_test.go@>=
+func TestMetaPostEndToEnd(t *testing.T) {
+	requireCommand(t, "mpost")
+	p, err := New(Options{Root: t.TempDir(), Renderers: []*Renderer{MetaPost}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `<metapost width="100">
+beginfig(1)
+  n:=3;
+  if n<5: draw fullcircle scaled 2cm; fi
+  label("n = "&decimal n, origin);
+endfig;
+</metapost>`
+	doc, err := htmldoc.Parse(strings.NewReader(src), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	@<Process |doc| and check that it became one MetaPost SVG@>
+}
+
+@ @<Process |doc| and check that it became one MetaPost SVG@>=
+if err := p.Process(context.Background(), doc, Request{BaseURI: "/p.html"}); err != nil {
+	t.Fatal(err)
+}
+if pre := htmldoc.Elements(doc, "pre"); len(pre) > 0 {
+	t.Fatalf("mpost failed: %s", htmldoc.TextContent(pre[0]))
+}
+img := htmldoc.Elements(doc, "img")
+if len(img) != 1 {
+	t.Fatalf("got %d img elements, want 1", len(img))
+}
+uri, _ := htmldoc.Attr(img[0], "src")
+if !strings.HasPrefix(uri, "/images/mpost") || !strings.HasSuffix(uri, ".svg") {
+	t.Errorf("src = %q", uri)
+}
+name := strings.TrimSuffix(strings.TrimPrefix(uri, "/images/"), ".svg")
+if got := readFile(t, p.svgPath(name)); !strings.Contains(got, "<svg") {
+	t.Errorf("output is not an SVG: %.60q", got)
+}
+
+@ Graphviz, with a \.{cmd} attribute that must pick \.{neato}.
+@(render_test.go@>=
+func TestGraphvizEndToEnd(t *testing.T) {
+	requireCommand(t, "dot")
+	p, err := New(Options{Root: t.TempDir(), Renderers: []*Renderer{Graphviz}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := htmldoc.Parse(strings.NewReader(`<graphviz cmd="neato">digraph{a->b->c}</graphviz>`), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Process(context.Background(), doc, Request{BaseURI: "/p.html"}); err != nil {
+		t.Fatal(err)
+	}
+	if pre := htmldoc.Elements(doc, "pre"); len(pre) > 0 {
+		t.Fatalf("dot failed: %s", htmldoc.TextContent(pre[0]))
+	}
+	if s, _ := htmldoc.Attr(htmldoc.Elements(doc, "img")[0], "src"); !strings.HasPrefix(s, "/images/neato") {
+		t.Errorf("src = %q, want the cmd attribute to pick neato", s)
+	}
+}
+
+@ Finally, a failing engine must leave the page standing, with the log in red
+where the image would have been, and the log must name the engine.
+@(render_test.go@>=
+func TestEngineFailureBecomesVisibleError(t *testing.T) {
+	requireCommand(t, "mpost")
+	p, err := New(Options{Root: t.TempDir(), Renderers: []*Renderer{MetaPost}, Logger: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `<metapost>this is not metapost at all (((</metapost>`
+	doc, err := htmldoc.Parse(strings.NewReader(src), p.RawTags()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Process(context.Background(), doc, Request{BaseURI: "/p.html"}); err != nil {
+		t.Fatal(err)
+	}
+	pre := htmldoc.Elements(doc, "pre")
+	if len(pre) != 1 {
+		t.Fatalf("got %d error nodes, want 1", len(pre))
+	}
+	if style, _ := htmldoc.Attr(pre[0], "style"); style != "color:red" {
+		t.Errorf("style = %q", style)
+	}
+	if got := htmldoc.TextContent(pre[0]); !strings.Contains(got, "mpost") {
+		t.Errorf("error text does not name the engine: %q", got)
+	}
+}
+
+@* Index.

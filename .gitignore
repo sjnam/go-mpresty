@@ -1,3 +1,11 @@
 /mpresty
 /dist/
 webapp/html/images/
+
+# gweave and TeX output; the .gw files are the source
+*.tex
+*.log
+*.toc
+*.idx
+*.scn
+*.pdf

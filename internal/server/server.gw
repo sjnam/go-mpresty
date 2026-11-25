@@ -1,0 +1,495 @@
+\def\title{SERVER}
+
+@s Processor int
+@s Logger int
+@s Handler int
+@s HandlerFunc int
+@s ResponseWriter int
+@s Request int
+@s Updaters int
+@s UpdateNodeFunc int
+@s Node int
+@s Renderer int
+@s Values int
+@s ResponseRecorder int
+@s T int
+
+@* Introduction.
+In the OpenResty version of mpresty the web server was nginx itself, and its
+configuration file \.{mpresty.conf} did the routing: one \.{location} block
+per special page, each with a little Lua in it, and nginx's own static file
+handler for everything else. This package takes the place of that file and of
+\.{lib/mpresty.lua}, which the blocks called. It serves a document root. HTML
+pages go through the renderer of package |render| on their way out; every
+other file goes out as it is.
+
+The routes are the ones \.{mpresty.conf} declared, so the sample pages that
+came with the original work unchanged:
+$$\vbox{\halign{\.{#}\hfil\quad&#\hfil\cr
+/*.html&rendered with the default rewrite to \.{<img>}\cr
+/benchmark.html&the same, with the elapsed time appended\cr
+/exemples.html&the source shown above each picture\cr
+/updatenode.html&a different rewrite for each tag\cr
+/preview.gxn&renders a snippet posted from a form\cr
+\hbox{\rm everything else}&served as a static file\cr}}$$
+
+@ The skeleton of the package.
+@c
+// Package server exposes the rendering pipeline over HTTP.
+package server
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/sjnam/go-mpresty/internal/htmldoc"
+	"github.com/sjnam/go-mpresty/internal/render"
+)
+
+@<Types and variables@>
+@<Functions@>
+
+@ A |Server| knows its document root, the processor that renders pages, and
+the names of the graphics elements, which the parser needs. For files that
+are not pages it keeps a standard file server over the same root.
+@<Types and variables@>=
+// Server serves a document root, rendering graphics in HTML pages on the
+// way out and passing everything else through as a static file.
+type Server struct {
+	root    string
+	proc    *render.Processor
+	rawTags []string
+	files   http.Handler
+	log     *slog.Logger
+}
+
+@ @<Functions@>=
+// New builds a Server over the given document root.
+func New(root string, proc *render.Processor, log *slog.Logger) (*Server, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Server{
+		root:    abs,
+		proc:    proc,
+		rawTags: proc.RawTags(),
+		files:   http.FileServer(http.Dir(abs)),
+		log:     log,
+	}, nil
+}
+
+@* Routes.
+The routing table uses the patterns of |http.ServeMux| as of \GO/~1.22, with a
+method in front. Most routes are the page handler with different updaters; in
+Lua each of them was a separate file next to the configuration
+(\.{exemples.lua}, \.{upnode.lua}), here each is a function value. The two
+that do more get sections of their own.
+@<Functions@>=
+// Handler returns the routing table.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	@<Route \.{/benchmark.html}@>
+	mux.Handle("GET /exemples.html", s.page(render.Updaters{Default: ExemplesUpdateNode}))
+	mux.Handle("GET /updatenode.html", s.page(render.Updaters{ByTag: UpdateNodeByTag}))
+	@<Route \.{/preview.gxn}@>
+	mux.Handle("/", s.page(render.Updaters{}))
+	return mux
+}
+
+@ The page handler is a closure over its updaters. A path ending in a slash
+means the directory's \.{index.html}. Anything that is not HTML goes to the
+static file server.
+@<Functions@>=
+// page renders an HTML document with the given updaters, and serves
+// anything else as a static file.
+func (s *Server) page(up render.Updaters) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uri := r.URL.Path
+		if strings.HasSuffix(uri, "/") {
+			uri += "index.html"
+		}
+		if ext := strings.ToLower(path.Ext(uri)); ext != ".html" && ext != ".htm" {
+			s.files.ServeHTTP(w, r)
+			return
+		}
+		@<Read the page |uri| into |body|@>
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		@<Render |body| with |up| and send it@>
+	}
+}
+
+@ The URI is made absolute and cleaned before it is joined to the root, so
+that no \.{..} can climb out of it. The check after the join is a second line
+of defence, and it also turns away the root itself, which is not a page.
+@<Read the page |uri| into |body|@>=
+name := filepath.Join(s.root, filepath.FromSlash(path.Clean("/"+strings.TrimPrefix(uri, "/"))))
+var body []byte
+var err error
+if strings.HasPrefix(name, s.root+string(os.PathSeparator)) {
+	body, err = os.ReadFile(name)
+} else {
+	err = fs.ErrPermission
+}
+
+@ @<Render |body| with |up| and send it@>=
+out, err := s.render(r, body, uri, up)
+if err != nil {
+	s.fail(w, r, err)
+	return
+}
+w.Header().Set("Content-Type", "text/html; charset=utf-8")
+w.Write(out)
+
+@ Rendering a page is parse, process, serialize. The query parameter
+\.{?debug} rebuilds every image on the page, as it did in Lua; the request's
+context goes to the processor, so the engines stop working on a page as soon
+as its client hangs up.
+@<Functions@>=
+// render parses, renders and serializes one document.
+func (s *Server) render(r *http.Request, body []byte, uri string, up render.Updaters) ([]byte, error) {
+	doc, err := htmldoc.Parse(bytes.NewReader(body), s.rawTags...)
+	if err != nil {
+		return nil, err
+	}
+	req := render.Request{
+		BaseURI:  uri,
+		NoCache:  r.URL.Query().Has("debug"),
+		Updaters: up,
+	}
+	if err := s.proc.Process(r.Context(), doc, req); err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := htmldoc.Render(&out, doc); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+@ Errors become status codes. A client that went away gets nothing, because
+there is nobody left to write to; everything unexpected is logged and becomes
+a 500.
+@<Functions@>=
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		http.Error(w, "404 page not found", http.StatusNotFound)
+	case errors.Is(err, fs.ErrPermission):
+		http.Error(w, "403 forbidden", http.StatusForbidden)
+	case r.Context().Err() != nil && errors.Is(err, r.Context().Err()):
+	default:
+		s.log.Error("request failed", "uri", r.URL.Path, "err", err)
+		http.Error(w, "500 internal server error", http.StatusInternalServerError)
+	}
+}
+
+@* The benchmark page.
+\.{benchmark.html} holds thirty-two figures, and in \.{mpresty.conf} its
+\.{content\_by\_lua\_block} timed the rendering and appended the elapsed
+seconds to the page. Here the ordinary page handler does the rendering, and a
+wrapper around it does the timing. The wrapper must not append its paragraph
+to a 404 or a 500, so it slips a |recorder| between the handler and the real
+response writer to learn the status.
+@<Route \.{/benchmark.html}@>=
+inner := s.page(render.Updaters{})
+mux.HandleFunc("GET /benchmark.html", func(w http.ResponseWriter, r *http.Request) {
+	begin := time.Now()
+	rec := &recorder{ResponseWriter: w}
+	inner.ServeHTTP(rec, r)
+	if rec.status == 0 || rec.status == http.StatusOK {
+		fmt.Fprintf(w, "<p>elapsed seconds: %.6f</p>", time.Since(begin).Seconds())
+	}
+})
+
+@ A handler that never calls |WriteHeader| succeeded implicitly, which is why
+a status of zero counts as success above.
+@<Types and variables@>=
+// recorder notes the status so benchmark only appends to successful pages.
+type recorder struct {
+	http.ResponseWriter
+	status int
+}
+
+@ @<Functions@>=
+func (r *recorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+@* The preview.
+\.{preview.html} is a form with a text area, a choice of engine and a choice of
+command. It posts them to \.{/preview.gxn}, and gets back the picture, or the
+error. The handler builds a one-element document around the submitted code
+and runs it through the same pipeline as any page, which is what
+\.{preview.lua} did. The element turns the cache off, since an author
+previewing is about to change the code anyway, and asks for a width of 400.
+
+The graphics tag is checked against the registered renderers up front, so that
+the form cannot name an arbitrary element.
+@<Route \.{/preview.gxn}@>=
+allowed := make(map[string]bool, len(s.rawTags))
+for _, tag := range s.rawTags {
+	allowed[tag] = true
+}
+mux.HandleFunc("POST /preview.gxn", func(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "400 bad request", http.StatusBadRequest)
+		return
+	}
+	gx := r.PostFormValue("gx")
+	if !allowed[gx] {
+		http.Error(w, "400 unknown graphics tag", http.StatusBadRequest)
+		return
+	}
+	@<Build the document |body| around the posted code@>
+	uri := "/preview.gxn"
+	up := render.Updaters{}
+	@<Render |body| with |up| and send it@>
+})
+
+@ The command, if any, becomes a \.{cmd} attribute. It reaches the engine as
+an element of an argument vector, never as a word for a shell, and the
+renderer's own list of commands has the final say.
+@<Build the document |body| around the posted code@>=
+var cmd string
+if c := r.PostFormValue("cmd"); c != "" {
+	cmd = fmt.Sprintf(" cmd=%q", c)
+}
+body := []byte(strings.Join([]string{
+	"<", gx, cmd, " cache='no' width='400'>\n",
+	r.PostFormValue("code"),
+	"\n</", gx, ">",
+}, ""))
+
+@* Updaters.
+The Lua version let a page customize its rewrite by dropping a \.{.lua} file
+next to the configuration. In \GO/ the same customization is an
+|render.UpdateNodeFunc| registered on a route in |Handler|. That is the one
+thing the port gives up: changing a rewrite now means recompiling. Embedding
+a Lua interpreter would bring the old flexibility back, if it ever seems worth
+the dependency.
+
+\.{exemples.html} is a gallery for learning MetaPost, so each example shows
+its source, the picture it makes, and a rule to separate it from the next.
+The graphics element becomes a paragraph holding those three.
+@<Functions@>=
+// ExemplesUpdateNode shows the source above the image.
+func ExemplesUpdateNode(doc, node *htmldoc.Node, uri, content string) {
+	htmldoc.Rename(node, "p")
+	htmldoc.RemoveAttr(node, "width")
+	pre := htmldoc.CreateElement("pre")
+	htmldoc.SetTextContent(pre, content)
+	node.AppendChild(pre)
+	img := htmldoc.CreateElement("img")
+	htmldoc.SetAttr(img, "src", uri)
+	htmldoc.SetAttr(img, "width", "200")
+	node.AppendChild(img)
+	node.AppendChild(htmldoc.CreateElement("hr"))
+}
+
+@ \.{updatenode.html} shows that the rewrite can differ by tag: its MetaPost
+figures get the gallery treatment, and everything else the default.
+@<Types and variables@>=
+// UpdateNodeByTag is the per-tag table /updatenode.html uses.
+var UpdateNodeByTag = map[string]render.UpdateNodeFunc{
+	"metapost": ExemplesUpdateNode,
+}
+
+@* Tests.
+\.{GTANGLE} writes the tests to \.{server\_test.go}. As in package |render|,
+the engine is a fake that copies its source to the SVG, so the tests need
+nothing installed. Each test builds a document root from a map of file names
+to contents.
+@(server_test.go@>=
+package server
+
+import (
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/sjnam/go-mpresty/internal/render"
+)
+
+@<Test helpers@>
+
+@ @<Test helpers@>=
+func newServer(t *testing.T, files map[string]string) http.Handler {
+	t.Helper()
+	root := t.TempDir()
+	for name, body := range files {
+		@<Write |body| to |name| under |root|@>
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	@<Let |proc| be a processor with the fake engine@>
+	s, err := New(root, proc, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Handler()
+}
+
+@ @<Write |body| to |name| under |root|@>=
+full := filepath.Join(root, filepath.FromSlash(name))
+if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+	t.Fatal(err)
+}
+if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+	t.Fatal(err)
+}
+
+@ @<Let |proc| be a processor with the fake engine@>=
+fake := &render.Renderer{
+	Tag:      "fake",
+	Ext:      "txt",
+	Cmd:      "cp",
+	Commands: []string{"cp"},
+	Command: func(cmd, fname string) []string {
+		return []string{"cp", fname + ".txt", fname + ".svg"}
+	},
+}
+opts := render.Options{Root: root, Renderers: []*render.Renderer{fake}, Logger: log}
+proc, err := render.New(opts)
+if err != nil {
+	t.Fatal(err)
+}
+
+@ Most tests make a single GET request.
+@<Test helpers@>=
+func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	return rec
+}
+
+@ A page comes back as HTML, with the graphics element replaced by an image
+and nothing left of the source element.
+@(server_test.go@>=
+func TestServesRenderedPage(t *testing.T) {
+	h := newServer(t, map[string]string{
+		"page.html": `<html><body><fake width="70">hi</fake></body></html>`,
+	})
+	rec := get(t, h, "/page.html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<img width="70" src="/images/cp`) {
+		t.Errorf("body = %q", body)
+	}
+	if strings.Contains(body, "<fake") {
+		t.Error("the source element survived into the output")
+	}
+}
+
+@ Anything that is not HTML goes out as a plain static file, untouched, even
+if it looks like a page with a graphics element in it.
+@(server_test.go@>=
+func TestServesStaticFilesUntouched(t *testing.T) {
+	h := newServer(t, map[string]string{"source/a.txt": "<fake>not html</fake>"})
+	rec := get(t, h, "/source/a.txt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != "<fake>not html</fake>" {
+		t.Errorf("body = %q, want it served verbatim", got)
+	}
+}
+
+@ A missing page is a 404, and a directory serves its \.{index.html}.
+@(server_test.go@>=
+func TestMissingPageIs404(t *testing.T) {
+	h := newServer(t, nil)
+	if rec := get(t, h, "/nope.html"); rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestDirectoryServesIndex(t *testing.T) {
+	h := newServer(t, map[string]string{"docs/index.html": `<p><fake>x</fake></p>`})
+	rec := get(t, h, "/docs/")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "<img") {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+@ The special routes. \.{updatenode.html} registers an updater for
+\.{metapost} only; the fake tag has none, so it must fall back to the default
+rewrite rather than fail.
+@(server_test.go@>=
+func TestBenchmarkAppendsElapsed(t *testing.T) {
+	h := newServer(t, map[string]string{"benchmark.html": `<p><fake>x</fake></p>`})
+	rec := get(t, h, "/benchmark.html")
+	if !strings.Contains(rec.Body.String(), "<p>elapsed seconds: ") {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+func TestUpdatenodeUsesPerTagUpdaters(t *testing.T) {
+	h := newServer(t, map[string]string{"updatenode.html": `<p><fake>x</fake></p>`})
+	if rec := get(t, h, "/updatenode.html"); !strings.Contains(rec.Body.String(), "<img") {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+@ The preview gets code with a \.{<} in it, which must survive the trip
+through the synthesized document, and comes back as an image 400 wide.
+@(server_test.go@>=
+func TestPreviewRendersPostedCode(t *testing.T) {
+	h := newServer(t, nil)
+	form := url.Values{"gx": {"fake"}, "cmd": {"cp"}, "code": {"if a<b: draw x;"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/preview.gxn", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `<img width="400" src="/images/cp`) {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+@ And a tag that no renderer claims is refused before anything is built.
+@(server_test.go@>=
+func TestPreviewRejectsUnknownTag(t *testing.T) {
+	h := newServer(t, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/preview.gxn", strings.NewReader("gx=evil&code=x"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+@* Index.

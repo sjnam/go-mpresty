@@ -1,3 +1,4 @@
+//line cache.gw:145
 package cache
 
 import (
@@ -10,10 +11,10 @@ func TestEvictsLeastRecentlyUsed(t *testing.T) {
 	c := New(2)
 	c.Set("a", "1")
 	c.Set("b", "2")
-	if _, ok := c.Get("a"); !ok { // a becomes most recent
+	if _, ok := c.Get("a"); !ok {
 		t.Fatal("a missing")
 	}
-	c.Set("c", "3") // evicts b
+	c.Set("c", "3")
 	if _, ok := c.Get("b"); ok {
 		t.Error("b should have been evicted")
 	}
@@ -25,6 +26,7 @@ func TestEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 }
 
+//line cache.gw:177
 func TestConcurrentUse(t *testing.T) {
 	c := New(64)
 	var wg sync.WaitGroup

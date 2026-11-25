@@ -1,8 +1,9 @@
-// Command mpresty serves a document root, turning MetaPost and Graphviz source
-// embedded in its HTML pages into SVG images.
+// Command mpresty serves a document root, turning MetaPost and Graphviz
+// source embedded in its HTML pages into SVG images.
 //
-// It is a Go port of https://github.com/sjnam/mpresty, which did the same with
-// OpenResty and Lua.
+//line mpresty.gw:23
+//line mpresty.gw:24
+//line mpresty.gw:25
 package main
 
 import (
@@ -22,6 +23,8 @@ import (
 )
 
 func main() {
+
+//line mpresty.gw:55
 	var (
 		addr     = flag.String("addr", ":8080", "address to listen on")
 		root     = flag.String("root", "webapp/html", "document root")
@@ -33,6 +36,9 @@ func main() {
 	)
 	flag.Parse()
 
+//line mpresty.gw:45
+
+//line mpresty.gw:70
 	level := slog.LevelInfo
 	if *verbose {
 		level = slog.LevelDebug
@@ -40,54 +46,73 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
 
-	if err := run(*addr, *root, *workdir, *timeout, *maxJobs, *cacheCap, log); err != nil {
-		log.Error("mpresty stopped", "err", err)
-		os.Exit(1)
-	}
-}
+//line mpresty.gw:46
 
-func run(addr, root, workdir string, timeout time.Duration, maxJobs, cacheCap int, log *slog.Logger) error {
+//line mpresty.gw:81
 	proc, err := render.New(render.Options{
-		Root:    root,
-		WorkDir: workdir,
-		Timeout: timeout,
-		MaxJobs: maxJobs,
-		Cache:   cache.New(cacheCap),
+		Root:    *root,
+		WorkDir: *workdir,
+		Timeout: *timeout,
+		MaxJobs: *maxJobs,
+		Cache:   cache.New(*cacheCap),
 		Logger:  log,
 	})
 	if err != nil {
-		return err
+
+//line mpresty.gw:100
+		log.Error("mpresty stopped", "err", err)
+		os.Exit(1)
+
+//line mpresty.gw:91
 	}
-	srv, err := server.New(root, proc, log)
+	srv, err := server.New(*root, proc, log)
 	if err != nil {
-		return err
+
+//line mpresty.gw:100
+		log.Error("mpresty stopped", "err", err)
+		os.Exit(1)
+
+//line mpresty.gw:95
 	}
 
+//line mpresty.gw:47
+
+//line mpresty.gw:112
 	httpd := &http.Server{
-		Addr:              addr,
+		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", addr, "root", root)
+		log.Info("listening", "addr", *addr, "root", *root)
 		errc <- httpd.ListenAndServe()
 	}()
 
+//line mpresty.gw:133
 	select {
-	case err := <-errc:
+	case err = <-errc:
 		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+			err = nil
 		}
-		return err
 	case <-ctx.Done():
 		log.Info("shutting down")
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return httpd.Shutdown(sctx)
+		err = httpd.Shutdown(sctx)
+		cancel()
 	}
+
+//line mpresty.gw:125
+	if err != nil {
+
+//line mpresty.gw:100
+		log.Error("mpresty stopped", "err", err)
+		os.Exit(1)
+
+//line mpresty.gw:127
+	}
+
+//line mpresty.gw:48
 }

@@ -72,7 +72,7 @@ The routes `mpresty.conf` declared, and what replaced each one:
 | `/benchmark.html` | timing wrapper | same, appends elapsed seconds |
 | `/exemples.html` | `lua/exemples.lua` | `server.ExemplesUpdateNode` |
 | `/updatenode.html` | `lua/upnode.lua` | `server.UpdateNodeByTag` |
-| `/preview.gxn` | `lua/preview.lua` | `(*Server).preview` |
+| `/preview.gxn` | `lua/preview.lua` | the preview route in `internal/server` |
 | everything else | `nginx` static | `http.FileServer` |
 
 ## Flags
@@ -158,6 +158,22 @@ internal/cache/   LRU for remote sources
 internal/server/  routes, static files, the per-route updaters
 webapp/html/      the sample pages, carried over unchanged
 ```
+
+## Literate source
+
+Each Go directory above holds a single [GWEB](https://github.com/sjnam/gweb)
+literate program, `<name>.gw`, from which `gtangle` produces `<name>.go` and,
+for the packages that have tests, `<name>_test.go`. The `.gw` files are the
+source; edit them, not the Go files.
+
+```bash
+make tangle   # .gw -> .go and _test.go
+make doc      # typeset each .gw as a PDF next to it (needs LuaTeX)
+```
+
+The tangled Go files are committed as well, so `go build`, `go install` and
+the Dockerfile need nothing but Go. The `//line` comments in them point
+compiler errors and stack traces back at the `.gw` files.
 
 ## License
 

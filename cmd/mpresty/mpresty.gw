@@ -1,0 +1,145 @@
+\def\title{MPRESTY}
+
+@s HandlerOptions int
+@s Server int
+
+@* Introduction.
+This is the command \.{mpresty}, which serves a document root and turns the
+MetaPost and Graphviz source embedded in its HTML pages into SVG images. It
+is a \GO/ port of \.{https://github.com/sjnam/mpresty}, which did the same
+with OpenResty and Lua; I made the port in August 2026, and rewrote it as a
+set of literate programs a few months later. This one is the smallest of
+them. It reads the command line, wires together the pieces that the other
+programs build, and serves until it is told to stop:
+$$\vbox{\halign{\.{#}\hfil\quad&#\hfil\cr
+internal/render&the engines, the job runner, the document walker\cr
+internal/htmldoc&parsing with shielded bodies, and DOM helpers\cr
+internal/cache&an LRU cache for remote sources\cr
+internal/server&routes, static files, and the per-route updaters\cr}}$$
+In the Lua original all this wiring was nginx's configuration file.
+
+@ The program is short enough to read straight through.
+@c
+// Command mpresty serves a document root, turning MetaPost and Graphviz
+// source embedded in its HTML pages into SVG images.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/sjnam/go-mpresty/internal/cache"
+	"github.com/sjnam/go-mpresty/internal/render"
+	"github.com/sjnam/go-mpresty/internal/server"
+)
+
+func main() {
+	@<Parse the command line@>
+	@<Set up the logger |log|@>
+	@<Build the processor |proc| and the server |srv|@>
+	@<Serve on |*addr| until interrupted@>
+}
+
+@ Every flag has a default that suits the sample pages of the repository, so
+\.{./mpresty} alone, run from the top of a checkout, serves them on port
+8080. Zero means ``choose for me'' for both \.{-jobs} and \.{-cache}; the packages
+that receive those numbers know what to choose.
+@<Parse the command line@>=
+var (
+	addr     = flag.String("addr", ":8080", "address to listen on")
+	root     = flag.String("root", "webapp/html", "document root")
+	workdir  = flag.String("workdir", "images", "directory for rendered SVGs, relative to root")
+	timeout  = flag.Duration("timeout", 30*time.Second, "wall clock budget for one engine run")
+	maxJobs  = flag.Int("jobs", 0, "concurrent engine runs (0 = GOMAXPROCS)")
+	cacheCap = flag.Int("cache", 0, "cache entries to keep (0 = default)")
+	verbose  = flag.Bool("v", false, "log at debug level")
+)
+flag.Parse()
+
+@ The log is structured, as text on the standard error stream, and becomes the
+process's default logger as well, for any package that logs without being
+handed one.
+@<Set up the logger |log|@>=
+level := slog.LevelInfo
+if *verbose {
+	level = slog.LevelDebug
+}
+log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+slog.SetDefault(log)
+
+@ The processor renders the graphics; the server routes requests to it.
+Each can fail at startup, the processor if it cannot create its work
+directory and the server if the root cannot be made absolute.
+@<Build the processor |proc| and the server |srv|@>=
+proc, err := render.New(render.Options{
+	Root:    *root,
+	WorkDir: *workdir,
+	Timeout: *timeout,
+	MaxJobs: *maxJobs,
+	Cache:   cache.New(*cacheCap),
+	Logger:  log,
+})
+if err != nil {
+	@<Stop with |err|@>
+}
+srv, err := server.New(*root, proc, log)
+if err != nil {
+	@<Stop with |err|@>
+}
+
+@ Every failure ends the same way. (Deferred calls are skipped by |os.Exit|,
+but none of them matter once the process is going away.)
+@<Stop with |err|@>=
+log.Error("mpresty stopped", "err", err)
+os.Exit(1)
+
+@ The \.{http.Server} gets a deadline for reading request headers, so that a
+client who opens a connection and then dawdles cannot hold it forever.
+
+The server runs in a goroutine of its own, and |main| waits for whichever
+comes first: the server failing, say because the port is taken, or an
+interrupt or a termination signal, which is how \.{docker stop} asks a
+container to finish. On a signal the server stops accepting connections and
+gives the requests in flight ten seconds to complete.
+@<Serve on |*addr| until interrupted@>=
+httpd := &http.Server{
+	Addr:              *addr,
+	Handler:           srv.Handler(),
+	ReadHeaderTimeout: 10 * time.Second,
+}
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+errc := make(chan error, 1)
+go func() {
+	log.Info("listening", "addr", *addr, "root", *root)
+	errc <- httpd.ListenAndServe()
+}()
+@<Wait for a failure or a signal, and set |err|@>
+if err != nil {
+	@<Stop with |err|@>
+}
+
+@ |ListenAndServe| always returns an error, and |ErrServerClosed| is the one
+that means a clean shutdown. That cannot arrive here before a signal does,
+but it costs nothing to treat it as success.
+@<Wait for a failure or a signal, and set |err|@>=
+select {
+case err = <-errc:
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
+	}
+case <-ctx.Done():
+	log.Info("shutting down")
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = httpd.Shutdown(sctx)
+	cancel()
+}
+
+@* Index.
